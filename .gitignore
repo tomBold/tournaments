@@ -1,0 +1,14 @@
+node_modules/
+dist/
+coverage/
+reports/
+.env
+*.tsbuildinfo
+*.log
+
+# Editor, AI tooling and OS files
+.cursor/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

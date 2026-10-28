@@ -1,0 +1,88 @@
+{
+  "name": "tournaments",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Tournaments service: bet ingestion, live Redis leaderboard, BullMQ-scheduled final results",
+  "scripts": {
+    "postinstall": "prisma generate",
+    "up": "docker compose up --build -d --wait",
+    "infra": "docker compose up -d --wait postgres redis",
+    "down": "docker compose down",
+    "logs": "docker compose logs -f api worker",
+    "build": "nest build",
+    "start": "node dist/main.js",
+    "start:worker": "node dist/worker.js",
+    "start:dev": "nest start --watch",
+    "start:worker:dev": "nest start --watch --entryFile worker",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate deploy",
+    "prisma:migrate:dev": "prisma migrate dev",
+    "test": "jest --runInBand",
+    "test:unit": "jest --selectProjects unit",
+    "test:e2e": "jest --runInBand --selectProjects e2e",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "verify": "npm run typecheck && npm run test:unit && npm run infra && npm run test:e2e"
+  },
+  "dependencies": {
+    "@fastify/static": "10.1.3",
+    "@nestjs/bullmq": "^11.0.4",
+    "@nestjs/common": "^11.1.6",
+    "@nestjs/config": "^4.0.2",
+    "@nestjs/core": "^11.1.6",
+    "@nestjs/platform-fastify": "^11.1.6",
+    "@nestjs/swagger": "^11.4.7",
+    "@prisma/client": "^6.19.0",
+    "bullmq": "^5.61.0",
+    "class-transformer": "^0.5.1",
+    "class-validator": "^0.14.2",
+    "ioredis": "^5.8.0",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.2"
+  },
+  "devDependencies": {
+    "@nestjs/cli": "^11.0.10",
+    "@nestjs/testing": "^11.1.6",
+    "@types/jest": "^30.0.0",
+    "@types/node": "^22.18.0",
+    "jest": "^30.1.3",
+    "jest-junit": "^17.0.0",
+    "prisma": "^6.19.0",
+    "ts-jest": "^29.4.4",
+    "typescript": "^5.9.2"
+  },
+  "jest": {
+    "projects": [
+      {
+        "displayName": "unit",
+        "moduleFileExtensions": [
+          "js",
+          "json",
+          "ts"
+        ],
+        "testRegex": "test/unit/.*\\.spec\\.ts$",
+        "transform": {
+          "^.+\\.ts$": "ts-jest"
+        },
+        "testEnvironment": "node"
+      },
+      {
+        "displayName": "e2e",
+        "moduleFileExtensions": [
+          "js",
+          "json",
+          "ts"
+        ],
+        "testRegex": "test/e2e/.*\\.e2e\\.spec\\.ts$",
+        "transform": {
+          "^.+\\.ts$": "ts-jest"
+        },
+        "testEnvironment": "node",
+        "setupFiles": [
+          "<rootDir>/test/e2e/env.ts"
+        ],
+        "globalSetup": "<rootDir>/test/e2e/global-setup.ts",
+        "testTimeout": 30000
+      }
+    ]
+  }
+}

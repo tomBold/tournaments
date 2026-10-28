@@ -1,0 +1,77 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum TournamentStatus {
+  OPEN
+  FINALIZED
+}
+
+model Tournament {
+  id          String           @id @default(uuid()) @db.Uuid
+  name        String
+  currency    String           @default("USD") @db.VarChar(3)
+  startsAt    DateTime         @map("starts_at") @db.Timestamptz(3)
+  endsAt      DateTime         @map("ends_at") @db.Timestamptz(3)
+  status      TournamentStatus @default(OPEN)
+  finalizedAt DateTime?        @map("finalized_at") @db.Timestamptz(3)
+  createdAt   DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  bets    TournamentBet[]
+  results TournamentResult[]
+
+  @@index([status, startsAt, endsAt])
+  @@map("tournaments")
+}
+
+/// Every bet event received, stored once regardless of how many tournaments it counts towards.
+model Bet {
+  id            String   @id @default(uuid()) @db.Uuid
+  externalBetId String   @unique @map("external_bet_id")
+  playerId      String   @map("player_id")
+  amount        Int
+  currency      String   @db.VarChar(3)
+  createdAt     DateTime @map("created_at") @db.Timestamptz(3)
+  receivedAt    DateTime @default(now()) @map("received_at") @db.Timestamptz(3)
+
+  tournaments TournamentBet[]
+
+  @@index([playerId])
+  @@map("bets")
+}
+
+/// A bet accepted into a tournament. The composite PK is what guarantees a bet is counted once per tournament.
+model TournamentBet {
+  tournamentId String   @map("tournament_id") @db.Uuid
+  betId        String   @map("bet_id") @db.Uuid
+  playerId     String   @map("player_id")
+  amount       Int
+  countedAt    DateTime @default(now()) @map("counted_at") @db.Timestamptz(3)
+
+  tournament Tournament @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+  bet        Bet        @relation(fields: [betId], references: [id], onDelete: Cascade)
+
+  @@id([tournamentId, betId])
+  @@index([tournamentId, playerId])
+  @@map("tournament_bets")
+}
+
+/// Final placements, written once by the snapshot job after endsAt.
+model TournamentResult {
+  tournamentId String   @map("tournament_id") @db.Uuid
+  playerId     String   @map("player_id")
+  score        BigInt
+  placement    Int
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  tournament Tournament @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+
+  @@id([tournamentId, playerId])
+  @@index([tournamentId, placement])
+  @@map("tournament_results")
+}

@@ -1,0 +1,127 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  checks: write # test reports are published as check runs
+
+env:
+  NODE_VERSION: 22
+  JEST_JUNIT_OUTPUT_DIR: reports
+  JEST_JUNIT_CLASSNAME: '{classname}'
+  JEST_JUNIT_TITLE: '{title}'
+  JEST_JUNIT_ADD_FILE_ATTRIBUTE: 'true'
+
+jobs:
+  checks:
+    name: Type check, build, unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - name: Unit tests
+        run: npm run test:unit -- --ci --reporters=default --reporters=jest-junit
+        env:
+          JEST_JUNIT_OUTPUT_NAME: unit.xml
+      - name: Unit test report
+        if: ${{ !cancelled() }}
+        uses: dorny/test-reporter@v3
+        with:
+          name: Unit test report
+          path: reports/unit.xml
+          reporter: jest-junit
+      - name: Upload unit test results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: unit-test-results
+          path: reports/
+
+  e2e:
+    name: End-to-end tests (Postgres + Redis)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - name: End-to-end tests
+        run: npm run test:e2e -- --ci --reporters=default --reporters=jest-junit
+        env:
+          JEST_JUNIT_OUTPUT_NAME: e2e.xml
+      - name: End-to-end test report
+        if: ${{ !cancelled() }}
+        uses: dorny/test-reporter@v3
+        with:
+          name: End-to-end test report
+          path: reports/e2e.xml
+          reporter: jest-junit
+      - name: Upload end-to-end test results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-test-results
+          path: reports/
+
+  docker:
+    name: Docker stack smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build and start API, worker, Postgres and Redis
+        run: docker compose up --build -d --wait
+      - name: API serves the OpenAPI spec
+        run: curl --fail --silent --show-error --retry 15 --retry-delay 2 --retry-all-errors http://localhost:3000/docs-json > /dev/null
+      - name: Worker started
+        run: |
+          for _ in $(seq 1 30); do
+            docker compose logs worker | grep -q "finalize worker started" && exit 0
+            sleep 1
+          done
+          echo "Worker did not start" && exit 1
+      - name: Logs on failure
+        if: ${{ failure() }}
+        run: docker compose logs
+      - name: Stop stack
+        if: ${{ always() }}
+        run: docker compose down
