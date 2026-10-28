@@ -3,6 +3,7 @@ dist/
 coverage/
 reports/
 .env
+TASK.md
 *.tsbuildinfo
 *.log
 

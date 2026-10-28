@@ -3,8 +3,6 @@
 A NestJS (Fastify) service that creates tournaments, ingests bet events, serves a **live leaderboard from Redis**,
 and uses a **BullMQ** delayed job to write **final placements to Postgres** after each tournament ends.
 
-> The original assignment is in [TASK.md](TASK.md).
-
 **Stack:** NestJS 11 · Fastify · Postgres 16 + Prisma 6 · Redis 7 · BullMQ · Jest · Docker Compose
 
 ---
