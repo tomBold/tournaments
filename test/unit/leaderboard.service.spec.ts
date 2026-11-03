@@ -1,6 +1,10 @@
 import { Logger } from '@nestjs/common';
 import Redis from 'ioredis';
-import { LeaderboardBet, LeaderboardService } from '../../src/tournaments/leaderboard.service';
+import {
+  LeaderboardBet,
+  LeaderboardOutOfSyncError,
+  LeaderboardService,
+} from '../../src/tournaments/leaderboard.service';
 import { FakeClock } from '../support/fake-clock';
 import { testConfig } from '../support/test-config';
 
@@ -131,6 +135,15 @@ describe('LeaderboardService', () => {
       redis.leaderboardAddBets.mockResolvedValue(0);
 
       await expect(serviceWith(redis).addBet('t1', new Date(), 'b1', 'alice', 250)).resolves.toBe(false);
+    });
+
+    it('reports a partially lost leaderboard, which the script refused to write to', async () => {
+      const redis = fakeRedis([]);
+      redis.leaderboardAddBets.mockResolvedValue(-1);
+
+      await expect(serviceWith(redis).addBet('t1', new Date(), 'b1', 'alice', 250)).rejects.toThrow(
+        LeaderboardOutOfSyncError,
+      );
     });
   });
 

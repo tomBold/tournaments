@@ -576,7 +576,30 @@ describe('Tournaments (e2e)', () => {
       ]);
     });
 
-    it('rebuilds when only the board was evicted, which bet retries cannot repair', async () => {
+    it('restores every historical score when a new bet arrives after only the board was lost', async () => {
+      const t = await seedStarted();
+      await app.get(LeaderboardOutboxService).relay();
+      await redis.del(LeaderboardService.boardKey(t.id));
+      const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation();
+
+      expect((await postBet({ playerId: 'carol', amount: 50 })).statusCode).toBe(200);
+      // Refused instead of starting a board that holds only the new bet.
+      expect(await redis.exists(LeaderboardService.boardKey(t.id))).toBe(0);
+      await expect(app.get(LeaderboardService).isInSync(t.id, 4)).resolves.toBe(false);
+
+      await app.get(LeaderboardOutboxService).relay();
+
+      expect(await scores(t.id)).toEqual([
+        ['bob', 700],
+        ['alice', 400],
+        ['carol', 50],
+      ]);
+      expect(await redis.scard(LeaderboardService.seenKey(t.id))).toBe(4);
+      await expect(repair()).resolves.toBe(0);
+      warn.mockRestore();
+    });
+
+    it('rebuilds when only the board was evicted', async () => {
       const t = await seedStarted();
       await redis.del(LeaderboardService.boardKey(t.id));
 

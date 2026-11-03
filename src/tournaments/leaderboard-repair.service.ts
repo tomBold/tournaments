@@ -31,7 +31,7 @@ export class LeaderboardRepairService {
       // One failing tournament must not stop the others from being repaired.
       try {
         if (await this.leaderboard.isInSync(t.id, t.counted)) continue;
-        await this.leaderboard.rebuild(t.id, t.ends_at, this.betsOf(t.id));
+        await this.rebuild(t.id, t.ends_at);
         rebuilt++;
       } catch (err) {
         this.logger.error(`Could not repair the live leaderboard of tournament ${t.id}`, err as Error);
@@ -39,6 +39,11 @@ export class LeaderboardRepairService {
     }
     if (rebuilt) this.logger.warn(`Rebuilt ${rebuilt} live leaderboard(s) from Postgres`);
     return rebuilt;
+  }
+
+  /** Rebuilds one tournament's live leaderboard from every bet counted in Postgres. */
+  rebuild(tournamentId: string, endsAt: Date): Promise<void> {
+    return this.leaderboard.rebuild(tournamentId, endsAt, this.betsOf(tournamentId));
   }
 
   private betsOf(tournamentId: string): LeaderboardBetSource {

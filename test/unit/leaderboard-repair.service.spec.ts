@@ -53,6 +53,12 @@ describe('LeaderboardRepairService', () => {
     expect(Logger.prototype.error).toHaveBeenCalledWith(expect.stringContaining('t1'), expect.any(Error));
   });
 
+  it('rebuilds a single tournament on request from its counted bets', async () => {
+    await service.rebuild('t1', ENDS_AT);
+
+    expect(leaderboard.rebuild).toHaveBeenCalledWith('t1', ENDS_AT, expect.any(Function));
+  });
+
   it('pages through tournament_bets in batches until a short batch', async () => {
     prisma.$queryRaw.mockResolvedValueOnce([{ id: 't1', ends_at: ENDS_AT, counted: 1001 }]);
     leaderboard.isInSync.mockResolvedValue(false);

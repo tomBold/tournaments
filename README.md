@@ -135,8 +135,9 @@ flowchart LR
     end
 
     subgraph Worker["Worker process - NestJS app context"]
-        FP["FinalizationProcessor<br/>finalize, sweep + repair jobs"]
+        FP["FinalizationProcessor<br/>finalize + sweep jobs"]
         FS["FinalizationService"]
+        LP["LeaderboardProcessor<br/>outbox relay + repair jobs"]
         RS["LeaderboardRepairService"]
     end
 
@@ -144,6 +145,7 @@ flowchart LR
         ZSET[("Sorted set per tournament<br/>live leaderboard")]
         SEEN[("Set per tournament<br/>bets already counted")]
         Q[("BullMQ queue<br/>tournament-finalization")]
+        LQ[("BullMQ queue<br/>leaderboard-maintenance")]
     end
 
     subgraph PG["Postgres (via Prisma)"]
@@ -169,7 +171,8 @@ flowchart LR
     FS -- "write placements" --> TR
     FS -- "mark FINALIZED" --> T
     FS -- "drop live keys" --> ZSET & SEEN
-    FP --> RS
+    LQ -- "every few seconds / minutes" --> LP
+    LP --> RS
     RS -- "rebuild from" --> TB
     RS -- "swap in rebuilt keys" --> ZSET & SEEN
 ```
@@ -180,7 +183,7 @@ flowchart LR
 | --- | --- | --- |
 | **Postgres** | Tournaments, every bet, which bets counted in which tournament, the Redis outbox, final results | Source of truth: durable, transactional, enforces "once per tournament" with a primary key |
 | **Redis: sorted sets** | Live score per player per tournament | Fast ranking (`ZINCRBY`, `ZREVRANGE`) for the live leaderboard |
-| **Redis: BullMQ** | Delayed finalize jobs, a periodic sweep and a periodic leaderboard repair | Runs the snapshot after `endsAt`, with retries |
+| **Redis: BullMQ** | Delayed finalize jobs and a periodic sweep; on a second queue, the periodic outbox relay and leaderboard repair | Runs the snapshot after `endsAt`, with retries. Separate queues get separate workers, so leaderboard upkeep never delays a finalize job |
 
 ### Dependency injection
 
@@ -237,8 +240,9 @@ sequenceDiagram
 - **Redis can't make a bet fail.** Every counted bet also gets a `leaderboard_outbox` row in the same statement,
   so it commits atomically with the count. If the Redis write right after the commit fails, the API logs it and
   still returns `200`, and the worker's **outbox relay** (every 5 s, `LEADERBOARD_OUTBOX_EVERY_MS`) applies the
-  row and deletes it. Clients no longer need to retry to fix the live board. The Redis client retries a command at
-  most twice, so an outage doesn't make requests hang either.
+  row and deletes it. Clients no longer need to retry to fix the live board. Each relay run handles at most 20
+  batches of 1,000 rows and leaves the rest to the next run, so a constantly full outbox can't keep one job running
+  forever. The Redis client retries a command at most twice, so an outage doesn't make requests hang either.
 - **Locks don't touch the tournament row.** Each bet takes a *shared* advisory lock per matching tournament, and
   finalization takes the same lock *exclusively* only to close the tournament (see below). Unlike `FOR SHARE`, an
   advisory lock lives in Postgres's lock table and never writes to the tournament row, so thousands of concurrent
@@ -297,10 +301,16 @@ that tournament stays `OPEN` or `CLOSING` and is retried by the next sweep.
 
 ### 4. Leaderboard repair
 
-The outbox relay covers a single lost Redis write, but not a leaderboard Redis lost as a whole after its outbox
-rows were relayed. Nor does it cover the case where only the board was evicted: the bet ids are still marked as
-counted, so their scores are never added back. A **repair job every 5 minutes** (`LEADERBOARD_REPAIR_EVERY_MS`)
-covers both cases:
+Every bet write creates or extends a tournament's two Redis keys together, so exactly one of them existing means
+Redis lost the other (for example, the board was evicted but the set of counted bet ids survived). The add-bets
+script then **refuses to write**: adding the next bet would start a board holding only that bet, while the
+historical bet ids stay marked as counted and are never added back. The API logs the refusal and returns `200`
+anyway. The outbox relay, on the same refusal, **rebuilds that tournament from Postgres** right after its batch
+commits, so the board comes back within `LEADERBOARD_OUTBOX_EVERY_MS` with every historical score.
+
+The relay doesn't cover a leaderboard Redis lost as a whole after its outbox rows were relayed: no further bet may
+arrive to reveal it, and if one does, both keys are missing, so the script can't tell. A **repair job every 5
+minutes** (`LEADERBOARD_REPAIR_EVERY_MS`) covers every case:
 
 1. For every started tournament that isn't finalized yet, it compares the number of counted bets in Postgres with the size
    of the Redis set of counted bet ids, and checks the board still exists.
@@ -393,9 +403,11 @@ src/
     ├── leaderboard-cursor.ts       Opaque page cursors (offset or keyset)
     ├── leaderboard-outbox.service.ts  Relays leaderboard_outbox rows into Redis
     ├── leaderboard-repair.service.ts  Rebuilds live leaderboards that are behind Postgres
-    ├── finalization.queue.ts       Queue name, job names and ids
+    ├── leaderboard.queue.ts        Leaderboard maintenance queue and job names
+    ├── leaderboard.processor.ts    BullMQ processor (outbox relay, repair), worker only
+    ├── finalization.queue.ts       Finalization queue name, job names and ids
     ├── finalization.service.ts     Closes a tournament, then writes final placements
-    ├── finalization.processor.ts   BullMQ processor (finalize, sweep, outbox relay, repair), worker only
+    ├── finalization.processor.ts   BullMQ processor (finalize, sweep), worker only
     └── dto/                        Request DTOs and their validation decorators
 test/
 ├── unit/                       One spec per source file, dependencies mocked (no Docker)
@@ -413,8 +425,8 @@ and the standard Nest role suffixes (`.module`, `.controller`, `.service`, `.pro
 
 | Command | What runs | Needs Docker |
 | --- | --- | --- |
-| `npm run test:unit` | 88 unit tests with mocked Prisma, Redis, BullMQ and config (a few seconds) | No |
-| `npm run test:e2e` | 37 end-to-end tests against real Postgres and Redis | Yes |
+| `npm run test:unit` | 94 unit tests with mocked Prisma, Redis, BullMQ and config (a few seconds) | No |
+| `npm run test:e2e` | 38 end-to-end tests against real Postgres and Redis | Yes |
 | `npm test` | Both (start Postgres + Redis first with `npm run infra`) | Yes |
 | `npm run verify` | Type check, unit tests, `npm run infra`, e2e tests; stops at the first failure | Yes |
 
@@ -443,7 +455,8 @@ and migrated automatically) and **Redis DB 15**, so dev data is never touched. T
 - **Outbox:** one row per counted bet, a bet accepted while Redis rejects writes and then relayed, no keys
   recreated for finalized tournaments
 - **Leaderboard repair:** intact boards left alone, rebuild after a full Redis wipe and after only the board was
-  evicted, no temporary keys left behind
+  evicted, every historical score restored when a new bet arrives after the board alone was lost, no temporary
+  keys left behind
 - **Health and API docs:** `/health` reports both stores up, Swagger UI is served and the spec lists every endpoint
 
 ### CI (GitHub Actions)

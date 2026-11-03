@@ -20,12 +20,24 @@ export interface LeaderboardBet {
 /** Yields every counted bet of a tournament in batches; called once per rebuild pass. */
 export type LeaderboardBetSource = () => AsyncIterable<LeaderboardBet[]>;
 
+/** Redis holds only one of a tournament's two keys; the leaderboard has to be rebuilt from Postgres. */
+export class LeaderboardOutOfSyncError extends Error {
+  constructor(readonly tournamentId: string) {
+    super(`Live leaderboard of tournament ${tournamentId} is partially lost and needs a rebuild`);
+  }
+}
+
 /** Temporary rebuild keys only need to outlive one rebuild; a crashed rebuild leaves nothing behind for long. */
 const REBUILD_KEY_TTL_SECONDS = 60 * 60;
 
 // Atomic per-tournament idempotency: a score is only incremented the first time its bet id is seen.
+// Every write creates or extends both keys together, so exactly one of them existing means Redis lost the
+// other; writing then would build a board from new bets alone, so the script refuses with -1.
 // ARGV: expireAt, then (betId, playerId, amount) per bet.
 const ADD_BETS_LUA = `
+if redis.call('EXISTS', KEYS[1]) ~= redis.call('EXISTS', KEYS[2]) then
+  return -1
+end
 local applied = 0
 for i = 2, #ARGV, 3 do
   if redis.call('SADD', KEYS[1], ARGV[i]) == 1 then
@@ -112,8 +124,8 @@ export class LeaderboardService implements OnApplicationBootstrap {
   }
 
   /**
-   * Evicting only one of a tournament's two keys leaves a state that client retries cannot repair (the bet ids
-   * are still "seen", so their scores are never re-added). Managed Redis often blocks CONFIG; then we can't tell.
+   * An evicted leaderboard shows wrong scores until it is rebuilt from Postgres. Managed Redis often blocks
+   * CONFIG; then we can't tell.
    */
   async onApplicationBootstrap(): Promise<void> {
     try {
@@ -128,7 +140,10 @@ export class LeaderboardService implements OnApplicationBootstrap {
     }
   }
 
-  /** Returns true if the bet was applied, false if it had already been counted. */
+  /**
+   * Returns true if the bet was applied, false if it had already been counted.
+   * Throws LeaderboardOutOfSyncError, without writing, when Redis lost one of the tournament's keys.
+   */
   async addBet(
     tournamentId: string,
     endsAt: Date,
@@ -136,23 +151,19 @@ export class LeaderboardService implements OnApplicationBootstrap {
     playerId: string,
     amount: number,
   ): Promise<boolean> {
-    const applied = await this.applyBets(
-      LeaderboardService.seenKey(tournamentId),
-      LeaderboardService.boardKey(tournamentId),
-      [{ betId, playerId, amount }],
-      this.expireAt(endsAt),
-    );
-    return applied === 1;
+    return (await this.addBets(tournamentId, endsAt, [{ betId, playerId, amount }])) === 1;
   }
 
   /** Batch form of `addBet` for one tournament. Returns how many bets were newly applied. */
   async addBets(tournamentId: string, endsAt: Date, bets: LeaderboardBet[]): Promise<number> {
-    return this.applyBets(
+    const applied = await this.applyBets(
       LeaderboardService.seenKey(tournamentId),
       LeaderboardService.boardKey(tournamentId),
       bets,
       this.expireAt(endsAt),
     );
+    if (applied < 0) throw new LeaderboardOutOfSyncError(tournamentId);
+    return applied;
   }
 
   /**
@@ -174,7 +185,7 @@ export class LeaderboardService implements OnApplicationBootstrap {
     }
     await this.redis.leaderboardReplace(rebuiltSeen, rebuiltBoard, seen, board, this.expireAt(endsAt));
     for await (const batch of loadBets()) {
-      await this.applyBets(seen, board, batch, this.expireAt(endsAt));
+      await this.addBets(tournamentId, endsAt, batch);
     }
   }
 

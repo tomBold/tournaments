@@ -9,8 +9,6 @@ import {
   FinalizationJobData,
 } from '../../src/tournaments/finalization.queue';
 import { FinalizationService } from '../../src/tournaments/finalization.service';
-import { LeaderboardOutboxService } from '../../src/tournaments/leaderboard-outbox.service';
-import { LeaderboardRepairService } from '../../src/tournaments/leaderboard-repair.service';
 import { tournamentsConfig } from '../../src/tournaments/tournaments.config';
 import { testConfig } from '../support/test-config';
 
@@ -19,8 +17,6 @@ const job = (name: string, data: FinalizationJobData = { tournamentId: 't1' }) =
 
 describe('FinalizationProcessor', () => {
   const finalization = { finalize: jest.fn(), findOverdue: jest.fn() };
-  const outbox = { relay: jest.fn() };
-  const repair = { repairOutOfSync: jest.fn() };
   const queue = { upsertJobScheduler: jest.fn() };
   let processor: FinalizationProcessor;
 
@@ -33,8 +29,6 @@ describe('FinalizationProcessor', () => {
       providers: [
         FinalizationProcessor,
         { provide: FinalizationService, useValue: finalization },
-        { provide: LeaderboardOutboxService, useValue: outbox },
-        { provide: LeaderboardRepairService, useValue: repair },
         { provide: getQueueToken(FINALIZATION_QUEUE), useValue: queue },
         { provide: tournamentsConfig.KEY, useValue: testConfig },
       ],
@@ -44,30 +38,14 @@ describe('FinalizationProcessor', () => {
 
   afterEach(() => jest.restoreAllMocks());
 
-  it('registers the sweep, outbox relay and repair schedulers with their configured intervals', async () => {
+  it('registers the sweep scheduler with the configured interval', async () => {
     await processor.onApplicationBootstrap();
 
-    expect(queue.upsertJobScheduler.mock.calls.map(([name, repeat, template]) => [name, repeat, template.name])).toEqual([
-      [FinalizationJob.Sweep, { every: testConfig.sweepEveryMs }, FinalizationJob.Sweep],
-      [FinalizationJob.RelayOutbox, { every: testConfig.leaderboardOutboxEveryMs }, FinalizationJob.RelayOutbox],
-      [
-        FinalizationJob.RepairLeaderboards,
-        { every: testConfig.leaderboardRepairEveryMs },
-        FinalizationJob.RepairLeaderboards,
-      ],
-    ]);
-  });
-
-  it('drains the outbox for a relay job', async () => {
-    outbox.relay.mockResolvedValue(3);
-
-    await expect(processor.process(job(FinalizationJob.RelayOutbox))).resolves.toBe(3);
-  });
-
-  it('runs the leaderboard repair for a repair job', async () => {
-    repair.repairOutOfSync.mockResolvedValue(1);
-
-    await expect(processor.process(job(FinalizationJob.RepairLeaderboards))).resolves.toBe(1);
+    expect(queue.upsertJobScheduler).toHaveBeenCalledWith(
+      FinalizationJob.Sweep,
+      { every: testConfig.sweepEveryMs },
+      expect.objectContaining({ name: FinalizationJob.Sweep }),
+    );
   });
 
   it('finalizes the tournament of a finalize job', async () => {
