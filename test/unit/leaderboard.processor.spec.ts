@@ -1,5 +1,5 @@
 import { getQueueToken } from '@nestjs/bullmq';
-import { Test } from '@nestjs/testing';
+import { Test, TestingModule } from '@nestjs/testing';
 import { Job } from 'bullmq';
 import { LeaderboardOutboxService } from '../../src/tournaments/leaderboard-outbox.service';
 import { LeaderboardRepairService } from '../../src/tournaments/leaderboard-repair.service';
@@ -15,10 +15,11 @@ describe('LeaderboardProcessor', () => {
   const repair = { repairOutOfSync: jest.fn() };
   const queue = { upsertJobScheduler: jest.fn() };
   let processor: LeaderboardProcessor;
+  let moduleRef: TestingModule;
 
   beforeEach(async () => {
     jest.resetAllMocks();
-    const moduleRef = await Test.createTestingModule({
+    moduleRef = await Test.createTestingModule({
       providers: [
         LeaderboardProcessor,
         { provide: LeaderboardOutboxService, useValue: outbox },
@@ -29,6 +30,8 @@ describe('LeaderboardProcessor', () => {
     }).compile();
     processor = moduleRef.get(LeaderboardProcessor);
   });
+
+  afterEach(() => moduleRef.close());
 
   it('registers the outbox relay and repair schedulers with their configured intervals', async () => {
     await processor.onApplicationBootstrap();
