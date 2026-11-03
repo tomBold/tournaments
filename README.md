@@ -31,8 +31,8 @@ docker compose up --build -d --wait     # or: npm run up
 ```
 
 This starts **Postgres → Redis → migrations → API + worker**, each waiting for what it depends on.
-The API listens on **http://localhost:3000**, and the interactive API docs (Swagger UI) are at
-**http://localhost:3000/docs**. Every endpoint there has a pre-filled valid example you can send with "Try it out".
+The API listens on **<http://localhost:3000>**, and the interactive API docs (Swagger UI) are at
+**<http://localhost:3000/docs>**. Every endpoint there has a pre-filled valid example you can send with "Try it out".
 
 | Command | What it does |
 | --- | --- |
@@ -81,6 +81,7 @@ curl -X POST localhost:3000/tournaments -H 'content-type: application/json' \
 curl -X POST localhost:3000/bet -H 'content-type: application/json' \
   -d '{"externalBetId":"bet_123456","playerId":"player_42","amount":250,"currency":"USD","createdAt":"2027-06-04T12:30:00.000Z"}'
 ```
+
 ```json
 { "betId": "…", "externalBetId": "bet_123456", "duplicate": false, "countedTournamentIds": ["…"] }
 ```
@@ -89,6 +90,7 @@ curl -X POST localhost:3000/bet -H 'content-type: application/json' \
 # 3. Read the leaderboard
 curl 'localhost:3000/tournaments/<id>/leaderboard?limit=10&offset=0'
 ```
+
 ```json
 {
   "tournamentId": "…", "status": "OPEN", "source": "live",
@@ -247,7 +249,8 @@ When the job runs, the worker does all of this in one transaction:
 
 The job is idempotent (running it twice is a no-op) and retries with exponential backoff. A **sweep job every
 60 s** finalizes any overdue tournament whose job was never enqueued, for example because Redis was down when the
-tournament was created.
+tournament was created. A failure on one tournament is logged and doesn't stop the sweep from handling the rest;
+that tournament stays `OPEN` and is retried by the next sweep.
 
 ---
 
@@ -296,7 +299,7 @@ Schema: [`prisma/schema.prisma`](prisma/schema.prisma). Migration: [`prisma/migr
 
 ## Project structure
 
-```
+```text
 src/
 ├── main.ts                     API entry point (Fastify)
 ├── worker.ts                   Worker entry point (no HTTP)
@@ -335,7 +338,7 @@ and the standard Nest role suffixes (`.module`, `.controller`, `.service`, `.pro
 
 | Command | What runs | Needs Docker |
 | --- | --- | --- |
-| `npm run test:unit` | 37 unit tests with mocked Prisma, Redis, BullMQ and config (a few seconds) | No |
+| `npm run test:unit` | 39 unit tests with mocked Prisma, Redis, BullMQ and config (a few seconds) | No |
 | `npm run test:e2e` | 23 end-to-end tests against real Postgres and Redis | Yes |
 | `npm test` | Both (start Postgres + Redis first with `npm run infra`) | Yes |
 | `npm run verify` | Type check, unit tests, `npm run infra`, e2e tests; stops at the first failure | Yes |
@@ -428,7 +431,9 @@ and tests replace the whole object with `{ provide: tournamentsConfig.KEY, useVa
   everything mid-tournament, the live board would be short until finalization (which is still correct).
   Rebuilding from `tournament_bets` would be a small addition.
 - **The row lock only affects the tournament being finalized.** Bets for other tournaments, and concurrent bets
-  for the same tournament, don't block each other.
+  for the same tournament, don't block each other. A bet for a tournament *while it is being finalized* waits for
+  the lock, so the bet transaction's timeout is `FINALIZE_TIMEOUT_MS` plus 5 s of headroom rather than Prisma's
+  5 s default; the bet then completes normally and is simply not counted towards the now-finalized tournament.
 - **Redis keys expire** 7 days after `endsAt` (or the latest write, if later). After that, Postgres is the only source.
 - **No RabbitMQ.** The task asks for BullMQ, which runs on the same Redis, so there's no extra broker to operate.
 - **Pinned to NestJS 11 and Prisma 6** (stable, well-known APIs) rather than the newest major versions.

@@ -1,7 +1,15 @@
-import { ConflictException, Injectable } from '@nestjs/common';
+import { ConflictException, Inject, Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateBetDto } from './dto/create-bet.dto';
 import { LeaderboardService } from './leaderboard.service';
+import { tournamentsConfig, TournamentsConfig } from './tournaments.config';
+
+/**
+ * Headroom added to the finalize timeout for the bet transaction. A bet for a tournament that is being
+ * finalized waits on the FOR SHARE lock for as long as finalization runs; with Prisma's default 5 s
+ * transaction timeout such bets would fail with a 500 instead of completing once the lock is released.
+ */
+const BET_TX_HEADROOM_MS = 5_000;
 
 export interface IngestBetResult {
   betId: string;
@@ -25,50 +33,54 @@ export class BetsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly leaderboard: LeaderboardService,
+    @Inject(tournamentsConfig.KEY) private readonly config: TournamentsConfig,
   ) {}
 
   async ingest(dto: CreateBetDto): Promise<IngestBetResult> {
     const createdAt = new Date(dto.createdAt);
 
-    const { bet, betIsNew, matched, newlyCounted } = await this.prisma.$transaction(async (tx) => {
-      const inserted = await tx.$queryRaw<BetRow[]>`
-        INSERT INTO bets (id, external_bet_id, player_id, amount, currency, created_at)
-        VALUES (gen_random_uuid(), ${dto.externalBetId}, ${dto.playerId}, ${dto.amount}, ${dto.currency}, ${createdAt})
-        ON CONFLICT (external_bet_id) DO NOTHING
-        RETURNING id, player_id, amount, currency, created_at`;
+    const { bet, betIsNew, matched, newlyCounted } = await this.prisma.$transaction(
+      async (tx) => {
+        const inserted = await tx.$queryRaw<BetRow[]>`
+          INSERT INTO bets (id, external_bet_id, player_id, amount, currency, created_at)
+          VALUES (gen_random_uuid(), ${dto.externalBetId}, ${dto.playerId}, ${dto.amount}, ${dto.currency}, ${createdAt})
+          ON CONFLICT (external_bet_id) DO NOTHING
+          RETURNING id, player_id, amount, currency, created_at`;
 
-      let bet = inserted[0];
-      if (!bet) {
-        [bet] = await tx.$queryRaw<BetRow[]>`
-          SELECT id, player_id, amount, currency, created_at FROM bets
-          WHERE external_bet_id = ${dto.externalBetId}`;
-        assertSamePayload(bet, dto, createdAt);
-      }
+        let bet = inserted[0];
+        if (!bet) {
+          [bet] = await tx.$queryRaw<BetRow[]>`
+            SELECT id, player_id, amount, currency, created_at FROM bets
+            WHERE external_bet_id = ${dto.externalBetId}`;
+          assertSamePayload(bet, dto, createdAt);
+        }
 
-      // FOR SHARE blocks finalization (FOR UPDATE) until this bet is committed, so a bet can never
-      // be counted into a tournament after its final placements have been written.
-      const matched = await tx.$queryRaw<{ id: string; ends_at: Date }[]>`
-        SELECT id, ends_at FROM tournaments
-        WHERE status = 'OPEN'
-          AND currency = ${dto.currency}
-          AND starts_at <= ${createdAt}
-          AND ends_at >= ${createdAt}
-        ORDER BY id
-        FOR SHARE`;
+        // FOR SHARE blocks finalization (FOR UPDATE) until this bet is committed, so a bet can never
+        // be counted into a tournament after its final placements have been written.
+        const matched = await tx.$queryRaw<{ id: string; ends_at: Date }[]>`
+          SELECT id, ends_at FROM tournaments
+          WHERE status = 'OPEN'
+            AND currency = ${dto.currency}
+            AND starts_at <= ${createdAt}
+            AND ends_at >= ${createdAt}
+          ORDER BY id
+          FOR SHARE`;
 
-      let newlyCounted: string[] = [];
-      if (matched.length > 0) {
-        const rows = await tx.$queryRaw<{ tournament_id: string }[]>`
-          INSERT INTO tournament_bets (tournament_id, bet_id, player_id, amount)
-          SELECT t.id, ${bet.id}::uuid, ${bet.player_id}, ${bet.amount}
-          FROM unnest(${matched.map((t) => t.id)}::uuid[]) AS t(id)
-          ON CONFLICT (tournament_id, bet_id) DO NOTHING
-          RETURNING tournament_id`;
-        newlyCounted = rows.map((r) => r.tournament_id);
-      }
+        let newlyCounted: string[] = [];
+        if (matched.length > 0) {
+          const rows = await tx.$queryRaw<{ tournament_id: string }[]>`
+            INSERT INTO tournament_bets (tournament_id, bet_id, player_id, amount)
+            SELECT t.id, ${bet.id}::uuid, ${bet.player_id}, ${bet.amount}
+            FROM unnest(${matched.map((t) => t.id)}::uuid[]) AS t(id)
+            ON CONFLICT (tournament_id, bet_id) DO NOTHING
+            RETURNING tournament_id`;
+          newlyCounted = rows.map((r) => r.tournament_id);
+        }
 
-      return { bet, betIsNew: inserted.length > 0, matched, newlyCounted };
-    });
+        return { bet, betIsNew: inserted.length > 0, matched, newlyCounted };
+      },
+      { timeout: this.config.finalizeTimeoutMs + BET_TX_HEADROOM_MS },
+    );
 
     // Applied for every matching tournament, not only the newly counted ones: the Redis script is
     // idempotent per bet, so a retry after a failed Redis write repairs the live leaderboard.

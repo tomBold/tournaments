@@ -35,9 +35,21 @@ export class FinalizationProcessor extends WorkerHost implements OnApplicationBo
       }
       case FinalizationJob.Sweep: {
         const overdue = await this.finalization.findOverdue();
-        for (const id of overdue) await this.finalization.finalize(id);
-        if (overdue.length) this.logger.warn(`Sweep finalized ${overdue.length} overdue tournament(s)`);
-        return overdue.length;
+        let finalized = 0;
+        for (const id of overdue) {
+          // One failing tournament (e.g. a timeout on a huge one) must not block the rest of the batch;
+          // it stays OPEN and is picked up again by the next sweep.
+          try {
+            await this.finalization.finalize(id);
+            finalized++;
+          } catch (err) {
+            this.logger.error(`Sweep could not finalize tournament ${id}`, err as Error);
+          }
+        }
+        if (overdue.length) {
+          this.logger.warn(`Sweep finalized ${finalized} of ${overdue.length} overdue tournament(s)`);
+        }
+        return finalized;
       }
       default:
         throw new Error(`Unknown job ${job.name}`);

@@ -23,6 +23,7 @@ describe('FinalizationProcessor', () => {
   beforeEach(async () => {
     jest.resetAllMocks();
     jest.spyOn(Logger.prototype, 'warn').mockImplementation();
+    jest.spyOn(Logger.prototype, 'error').mockImplementation();
 
     const moduleRef = await Test.createTestingModule({
       providers: [
@@ -72,6 +73,21 @@ describe('FinalizationProcessor', () => {
 
     await expect(processor.process(job(FinalizationJob.Sweep))).resolves.toBe(2);
     expect(finalization.finalize.mock.calls).toEqual([['t1'], ['t2']]);
+  });
+
+  it('sweep continues with the remaining tournaments when one fails', async () => {
+    finalization.findOverdue.mockResolvedValue(['t1', 't2', 't3']);
+    finalization.finalize
+      .mockResolvedValueOnce('finalized')
+      .mockRejectedValueOnce(new Error('transaction timeout'))
+      .mockResolvedValueOnce('finalized');
+
+    await expect(processor.process(job(FinalizationJob.Sweep))).resolves.toBe(2);
+    expect(finalization.finalize.mock.calls).toEqual([['t1'], ['t2'], ['t3']]);
+    expect(Logger.prototype.error).toHaveBeenCalledWith(
+      expect.stringContaining('t2'),
+      expect.any(Error),
+    );
   });
 
   it('rejects unknown job names', async () => {

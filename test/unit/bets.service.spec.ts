@@ -2,6 +2,7 @@ import { ConflictException } from '@nestjs/common';
 import { PrismaService } from '../../src/prisma/prisma.service';
 import { BetsService } from '../../src/tournaments/bets.service';
 import { LeaderboardService } from '../../src/tournaments/leaderboard.service';
+import { testConfig } from '../support/test-config';
 
 const dto = {
   externalBetId: 'bet_1',
@@ -23,17 +24,30 @@ describe('BetsService', () => {
   // Each $queryRaw call inside the transaction returns the next queued result, in SQL order:
   // insert bet -> (select existing bet, if the insert was a no-op) -> matching tournaments -> insert tournament_bets.
   const tx = { $queryRaw: jest.fn() };
-  const prisma = { $transaction: jest.fn((fn: (t: typeof tx) => unknown) => fn(tx)) };
+  const prisma = {
+    $transaction: jest.fn((fn: (t: typeof tx) => unknown, _options?: unknown) => fn(tx)),
+  };
   const leaderboard = { addBet: jest.fn() };
   let service: BetsService;
 
   beforeEach(() => {
     tx.$queryRaw.mockReset();
+    prisma.$transaction.mockClear();
     leaderboard.addBet.mockReset();
     service = new BetsService(
       prisma as unknown as PrismaService,
       leaderboard as unknown as LeaderboardService,
+      testConfig,
     );
+  });
+
+  it('gives the transaction more time than finalization, so bets waiting on its lock do not time out', async () => {
+    tx.$queryRaw.mockResolvedValueOnce([storedBet]).mockResolvedValueOnce([]);
+
+    await service.ingest(dto);
+
+    const [, options] = prisma.$transaction.mock.calls[0] as [unknown, { timeout: number }];
+    expect(options.timeout).toBeGreaterThan(testConfig.finalizeTimeoutMs);
   });
 
   it('counts a new bet towards every matching tournament and updates each live leaderboard', async () => {
