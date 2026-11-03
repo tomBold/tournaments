@@ -1,6 +1,6 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
-import { IsInt, IsOptional, Max, Min } from 'class-validator';
+import { IsInt, IsOptional, IsString, Max, MaxLength, Min } from 'class-validator';
 
 export class LeaderboardQueryDto {
   @ApiPropertyOptional({ default: 50, minimum: 1, maximum: 100 })
@@ -17,4 +17,14 @@ export class LeaderboardQueryDto {
   @IsInt()
   @Min(0)
   offset: number = 0;
+
+  @ApiPropertyOptional({
+    description:
+      '`nextCursor` from the previous page. Takes precedence over `offset`, and stays fast on deep pages of ' +
+      'final results.',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(512)
+  cursor?: string;
 }

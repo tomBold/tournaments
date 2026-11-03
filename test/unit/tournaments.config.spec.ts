@@ -26,6 +26,8 @@ describe('tournamentsConfig', () => {
     ['FINALIZE_GRACE_MS', '-1'],
     ['FINALIZE_ATTEMPTS', '0'],
     ['FINALIZE_SWEEP_BATCH_SIZE', '1.5'],
+    ['LEADERBOARD_REPAIR_EVERY_MS', '10'],
+    ['LEADERBOARD_OUTBOX_EVERY_MS', '0'],
   ])('fails fast on invalid %s=%s', (name, value) => {
     process.env[name] = value;
 

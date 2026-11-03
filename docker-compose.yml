@@ -45,6 +45,12 @@ services:
     command: ["node", "dist/main.js"]
     ports:
       - "3000:3000"
+    # Not "localhost": in Alpine it resolves to ::1, and the API only listens on IPv4.
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
     depends_on:
       migrate:
         condition: service_completed_successfully

@@ -5,6 +5,7 @@ import {
   ApiOkResponse,
   ApiOperation,
   ApiTags,
+  ApiUnprocessableEntityResponse,
 } from '@nestjs/swagger';
 import { BetsService, IngestBetResult } from './bets.service';
 import { CreateBetDto } from './dto/create-bet.dto';
@@ -31,6 +32,9 @@ export class BetsController {
   })
   @ApiBadRequestResponse({ description: 'Invalid payload' })
   @ApiConflictResponse({ description: 'externalBetId already received with a different payload' })
+  @ApiUnprocessableEntityResponse({
+    description: "The bet would push the player's score past 2^53 - 1 cents in a tournament",
+  })
   ingest(@Body() dto: CreateBetDto): Promise<IngestBetResult> {
     return this.bets.ingest(dto);
   }

@@ -110,8 +110,10 @@ jobs:
       - uses: actions/checkout@v7
       - name: Build and start API, worker, Postgres and Redis
         run: docker compose up --build -d --wait
-      - name: API serves the OpenAPI spec
-        run: curl --fail --silent --show-error --retry 15 --retry-delay 2 --retry-all-errors http://localhost:3000/docs-json > /dev/null
+      - name: API is healthy and serves the OpenAPI spec
+        run: |
+          curl --fail --silent --show-error --retry 15 --retry-delay 2 --retry-all-errors http://localhost:3000/health
+          curl --fail --silent --show-error http://localhost:3000/docs-json > /dev/null
       - name: Worker started
         run: |
           for _ in $(seq 1 30); do

@@ -9,6 +9,8 @@ datasource db {
 
 enum TournamentStatus {
   OPEN
+  /// No longer accepts bets; final placements are being written.
+  CLOSING
   FINALIZED
 }
 
@@ -55,10 +57,24 @@ model TournamentBet {
 
   tournament Tournament @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
   bet        Bet        @relation(fields: [betId], references: [id], onDelete: Cascade)
+  outbox     LeaderboardOutbox?
 
   @@id([tournamentId, betId])
   @@index([tournamentId, playerId])
   @@map("tournament_bets")
+}
+
+/// Counted bets not yet confirmed in Redis. Written in the bet transaction, deleted by the worker's relay.
+model LeaderboardOutbox {
+  tournamentId String   @map("tournament_id") @db.Uuid
+  betId        String   @map("bet_id") @db.Uuid
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  tournamentBet TournamentBet @relation(fields: [tournamentId, betId], references: [tournamentId, betId], onDelete: Cascade)
+
+  @@id([tournamentId, betId])
+  @@index([createdAt])
+  @@map("leaderboard_outbox")
 }
 
 /// Final placements, written once by the snapshot job after endsAt.

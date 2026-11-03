@@ -8,5 +8,7 @@ export const testConfig: TournamentsConfig = {
   finalizeTimeoutMs: 2_000,
   sweepEveryMs: 15_000,
   sweepBatchSize: 25,
+  leaderboardOutboxEveryMs: 3_000,
+  leaderboardRepairEveryMs: 45_000,
   leaderboardTtlAfterEndSeconds: 3_600,
 };

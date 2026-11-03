@@ -11,6 +11,9 @@ import { PrismaService } from '../../src/prisma/prisma.service';
 import { REDIS } from '../../src/redis/redis.module';
 import { FINALIZATION_QUEUE, finalizeJobId } from '../../src/tournaments/finalization.queue';
 import { FinalizationService } from '../../src/tournaments/finalization.service';
+import { LeaderboardOutboxService } from '../../src/tournaments/leaderboard-outbox.service';
+import { LeaderboardRepairService } from '../../src/tournaments/leaderboard-repair.service';
+import { LeaderboardService } from '../../src/tournaments/leaderboard.service';
 import { FakeClock } from '../support/fake-clock';
 
 describe('Tournaments (e2e)', () => {
@@ -379,6 +382,224 @@ describe('Tournaments (e2e)', () => {
       clock.set(new Date('2099-06-15T00:00:00.000Z'));
       expect(await finalization.finalize(t.id)).toBe('not-ended');
     });
+
+    it('frees the live Redis keys once results are in Postgres', async () => {
+      const t = await createTournament();
+      await postBet();
+      expect(await redis.exists(LeaderboardService.boardKey(t.id))).toBe(1);
+
+      clock.set(AFTER_END);
+      await app.get(FinalizationService).finalize(t.id);
+
+      expect(
+        await redis.exists(LeaderboardService.boardKey(t.id), LeaderboardService.seenKey(t.id)),
+      ).toBe(0);
+      expect((await leaderboard(t.id)).items).toHaveLength(1);
+    });
+
+    it('logs a bet that arrives after its tournament was finalized', async () => {
+      const t = await createTournament();
+      clock.set(AFTER_END);
+      await app.get(FinalizationService).finalize(t.id);
+      const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation();
+
+      const late = await postBet({ externalBetId: 'bet_late' });
+
+      expect(late.json().countedTournamentIds).toEqual([]);
+      expect(warn).toHaveBeenCalledWith(expect.stringMatching(new RegExp(`bet_late.*${t.id}`)));
+      warn.mockRestore();
+    });
+  });
+
+  describe('two-step finalization', () => {
+    it('stops counting bets once a tournament is CLOSING, but keeps serving it live', async () => {
+      const t = await createTournament();
+      await postBet({ playerId: 'alice', amount: 300 });
+      await prisma.tournament.update({ where: { id: t.id }, data: { status: 'CLOSING' } });
+
+      const res = await postBet({ playerId: 'bob', amount: 900 });
+
+      expect(res.json().countedTournamentIds).toEqual([]);
+      const board = await leaderboard(t.id);
+      expect(board).toMatchObject({ status: 'CLOSING', source: 'live' });
+      expect(board.items.map((i: { playerId: string }) => i.playerId)).toEqual(['alice']);
+
+      clock.set(AFTER_END);
+      expect(await app.get(FinalizationService).finalize(t.id)).toBe('finalized');
+      expect((await leaderboard(t.id)).source).toBe('final');
+    });
+
+    it('never counts a bet after the results were computed, even when they race', async () => {
+      const t = await createTournament();
+      for (let i = 0; i < 3; i++) await postBet({ playerId: `p${i}`, amount: 100 });
+      clock.set(AFTER_END);
+
+      const [, ...bets] = await Promise.all([
+        app.get(FinalizationService).finalize(t.id),
+        ...Array.from({ length: 20 }, (_, i) => postBet({ playerId: `p${i % 4}`, amount: 100 })),
+      ]);
+
+      expect(bets.every((r) => r.statusCode === 200)).toBe(true);
+      const [{ counted, results }] = await prisma.$queryRaw<{ counted: bigint; results: bigint }[]>`
+        SELECT (SELECT COALESCE(SUM(amount), 0)::bigint FROM tournament_bets WHERE tournament_id = ${t.id}::uuid) AS counted,
+               (SELECT COALESCE(SUM(score), 0)::bigint FROM tournament_results WHERE tournament_id = ${t.id}::uuid) AS results`;
+      expect(counted).toBeGreaterThanOrEqual(300n);
+      expect(results).toBe(counted);
+    });
+  });
+
+  describe('leaderboard outbox', () => {
+    const relay = () => app.get(LeaderboardOutboxService).relay();
+
+    it('queues each counted bet and drains the queue on relay', async () => {
+      await createTournament();
+      await createTournament({ name: 'Second' });
+      await postBet();
+
+      expect(await prisma.leaderboardOutbox.count()).toBe(2);
+      await expect(relay()).resolves.toBe(0);
+      expect(await prisma.leaderboardOutbox.count()).toBe(0);
+    });
+
+    it('accepts a bet while Redis rejects writes, and the relay brings the leaderboard up to date', async () => {
+      const t = await createTournament();
+      const addBet = jest
+        .spyOn(app.get(LeaderboardService), 'addBet')
+        .mockRejectedValueOnce(new Error('Connection is closed'));
+      const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation();
+
+      const res = await postBet({ playerId: 'alice', amount: 250 });
+
+      expect(res.statusCode).toBe(200);
+      expect((await leaderboard(t.id)).total).toBe(0);
+      await expect(relay()).resolves.toBe(1);
+      expect((await leaderboard(t.id)).items).toEqual([{ placement: 1, playerId: 'alice', score: 250 }]);
+      addBet.mockRestore();
+      warn.mockRestore();
+    });
+
+    it('does not recreate the Redis keys of a finalized tournament', async () => {
+      const t = await createTournament();
+      await postBet();
+      clock.set(AFTER_END);
+      await app.get(FinalizationService).finalize(t.id);
+
+      await relay();
+
+      expect(await redis.exists(LeaderboardService.boardKey(t.id))).toBe(0);
+      expect(await prisma.leaderboardOutbox.count()).toBe(0);
+    });
+  });
+
+  describe('cursor pagination', () => {
+    const players: [string, number][] = [
+      ['p1', 600],
+      ['p2', 500],
+      ['p3', 500],
+      ['p4', 500],
+      ['p5', 100],
+    ];
+
+    const walk = async (id: string, limit: number) => {
+      const seen: string[] = [];
+      let cursor: string | null = null;
+      do {
+        const query: string = cursor ? `?limit=${limit}&cursor=${cursor}` : `?limit=${limit}`;
+        const page = await leaderboard(id, query);
+        seen.push(...page.items.map((i: { placement: number; playerId: string }) => `${i.placement}:${i.playerId}`));
+        cursor = page.nextCursor;
+      } while (cursor);
+      return seen;
+    };
+
+    it('walks live and final pages by cursor in the same order as one big page', async () => {
+      const t = await createTournament();
+      for (const [playerId, amount] of players) await postBet({ playerId, amount });
+      const expected = ['1:p1', '2:p4', '2:p3', '2:p2', '5:p5'];
+
+      expect(await walk(t.id, 2)).toEqual(expected);
+
+      clock.set(AFTER_END);
+      await app.get(FinalizationService).finalize(t.id);
+      expect(await walk(t.id, 2)).toEqual(expected);
+    });
+
+    it('continues a live cursor after the tournament is finalized', async () => {
+      const t = await createTournament();
+      for (const [playerId, amount] of players) await postBet({ playerId, amount });
+      const first = await leaderboard(t.id, '?limit=2');
+
+      clock.set(AFTER_END);
+      await app.get(FinalizationService).finalize(t.id);
+      const next = await leaderboard(t.id, `?limit=2&cursor=${first.nextCursor}`);
+
+      expect(next).toMatchObject({ source: 'final', offset: 2 });
+      expect(next.items.map((i: { playerId: string }) => i.playerId)).toEqual(['p3', 'p2']);
+    });
+
+    it('rejects a malformed cursor', async () => {
+      const t = await createTournament();
+      const res = await app.inject({ method: 'GET', url: `/tournaments/${t.id}/leaderboard?cursor=nope` });
+      expect(res.statusCode).toBe(400);
+    });
+  });
+
+  describe('leaderboard repair', () => {
+    const repair = () => app.get(LeaderboardRepairService).repairOutOfSync();
+    const scores = async (id: string) =>
+      (await leaderboard(id)).items.map((i: { playerId: string; score: number }) => [i.playerId, i.score]);
+
+    const seedStarted = async () => {
+      const t = await createTournament();
+      await postBet({ playerId: 'alice', amount: 300 });
+      await postBet({ playerId: 'bob', amount: 700 });
+      await postBet({ playerId: 'alice', amount: 100 });
+      clock.set(new Date('2099-06-15T00:00:00.000Z'));
+      return t;
+    };
+
+    it('leaves an intact leaderboard alone', async () => {
+      await seedStarted();
+
+      await expect(repair()).resolves.toBe(0);
+    });
+
+    it('rebuilds a leaderboard Redis lost completely', async () => {
+      const t = await seedStarted();
+      await redis.flushdb();
+
+      await expect(repair()).resolves.toBe(1);
+
+      expect(await scores(t.id)).toEqual([
+        ['bob', 700],
+        ['alice', 400],
+      ]);
+    });
+
+    it('rebuilds when only the board was evicted, which bet retries cannot repair', async () => {
+      const t = await seedStarted();
+      await redis.del(LeaderboardService.boardKey(t.id));
+
+      await expect(repair()).resolves.toBe(1);
+
+      expect(await scores(t.id)).toEqual([
+        ['bob', 700],
+        ['alice', 400],
+      ]);
+      // The rebuilt seen-set keeps retries idempotent.
+      expect(await redis.scard(LeaderboardService.seenKey(t.id))).toBe(3);
+      expect(await redis.ttl(LeaderboardService.boardKey(t.id))).toBeGreaterThan(0);
+      expect(await redis.keys('*:rebuild:*')).toEqual([]);
+    });
+  });
+
+  describe('health', () => {
+    it('reports Postgres and Redis as up', async () => {
+      const res = await app.inject({ method: 'GET', url: '/health' });
+
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({ status: 'ok', postgres: 'up', redis: 'up' });
+    });
   });
 
   describe('api docs', () => {
@@ -389,7 +610,7 @@ describe('Tournaments (e2e)', () => {
 
       const spec = (await app.inject({ method: 'GET', url: '/docs-json' })).json();
       expect(Object.keys(spec.paths).sort()).toEqual(
-        ['/bet', '/tournaments', '/tournaments/{id}/leaderboard'].sort(),
+        ['/bet', '/health', '/tournaments', '/tournaments/{id}/leaderboard'].sort(),
       );
       expect(spec.components.schemas.CreateBetDto.required).toEqual(
         expect.arrayContaining(['externalBetId', 'playerId', 'amount', 'currency', 'createdAt']),

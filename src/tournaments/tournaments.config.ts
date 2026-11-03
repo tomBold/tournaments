@@ -21,6 +21,10 @@ export const tournamentsConfig = registerAs('tournaments', () => ({
   /** How often the worker looks for overdue tournaments whose finalize job was never enqueued. */
   sweepEveryMs: intFromEnv('FINALIZE_SWEEP_EVERY_MS', 60_000, 1_000),
   sweepBatchSize: intFromEnv('FINALIZE_SWEEP_BATCH_SIZE', 100, 1),
+  /** How often the worker applies outbox rows to Redis (bets whose live update may have failed). */
+  leaderboardOutboxEveryMs: intFromEnv('LEADERBOARD_OUTBOX_EVERY_MS', 5_000, 1_000),
+  /** How often the worker rebuilds live leaderboards that Redis lost or evicted. */
+  leaderboardRepairEveryMs: intFromEnv('LEADERBOARD_REPAIR_EVERY_MS', 300_000, 1_000),
   /** How long live leaderboard keys outlive endsAt (or the latest write, if later). */
   leaderboardTtlAfterEndSeconds: intFromEnv('LEADERBOARD_TTL_AFTER_END_SECONDS', 7 * 24 * 60 * 60, 1),
 }));

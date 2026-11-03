@@ -10,7 +10,10 @@ export const REDIS = Symbol('REDIS');
     {
       provide: REDIS,
       inject: [ConfigService],
-      useFactory: (config: ConfigService) => new Redis(config.getOrThrow<string>('REDIS_URL')),
+      // A bet is already committed in Postgres when its Redis write runs; with ioredis' default of
+      // 20 retries a Redis outage would hang each request instead of returning a retryable 500.
+      useFactory: (config: ConfigService) =>
+        new Redis(config.getOrThrow<string>('REDIS_URL'), { maxRetriesPerRequest: 2 }),
     },
   ],
   exports: [REDIS],

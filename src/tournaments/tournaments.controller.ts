@@ -55,12 +55,13 @@ export class TournamentsController {
           { placement: 1, playerId: 'alice', score: 550 },
           { placement: 3, playerId: 'bob', score: 500 },
         ],
+        nextCursor: null,
       },
     },
   })
-  @ApiBadRequestResponse({ description: 'Invalid id, limit or offset' })
+  @ApiBadRequestResponse({ description: 'Invalid id, limit, offset or cursor' })
   @ApiNotFoundResponse({ description: 'Unknown tournament' })
   leaderboard(@Param('id', ParseUUIDPipe) id: string, @Query() query: LeaderboardQueryDto) {
-    return this.tournaments.getLeaderboard(id, query.limit, query.offset);
+    return this.tournaments.getLeaderboard(id, query.limit, query.offset, query.cursor);
   }
 }

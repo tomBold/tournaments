@@ -1,6 +1,7 @@
 import { getQueueToken } from '@nestjs/bullmq';
 import { BadRequestException, Logger, NotFoundException } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
+import { Prisma } from '@prisma/client';
 import { Clock } from '../../src/clock/clock.service';
 import { PrismaService } from '../../src/prisma/prisma.service';
 import {
@@ -8,6 +9,7 @@ import {
   FinalizationJob,
   finalizeJobId,
 } from '../../src/tournaments/finalization.queue';
+import { decodeCursor, encodeCursor } from '../../src/tournaments/leaderboard-cursor';
 import { LeaderboardService } from '../../src/tournaments/leaderboard.service';
 import { tournamentsConfig } from '../../src/tournaments/tournaments.config';
 import { TournamentsService } from '../../src/tournaments/tournaments.service';
@@ -123,7 +125,15 @@ describe('TournamentsService', () => {
         limit: 10,
         offset: 20,
         items,
+        nextCursor: null,
       });
+    });
+
+    it('keeps serving a CLOSING tournament live until its results are written', async () => {
+      prisma.tournament.findUnique.mockResolvedValue({ id: 't1', status: 'CLOSING' });
+      leaderboard.getPage.mockResolvedValue({ total: 0, items: [] });
+
+      await expect(service.getLeaderboard('t1', 10, 0)).resolves.toMatchObject({ source: 'live' });
     });
 
     it('serves a finalized tournament from Postgres results', async () => {
@@ -137,11 +147,53 @@ describe('TournamentsService', () => {
       const page = await service.getLeaderboard('t1', 10, 0);
 
       expect(leaderboard.getPage).not.toHaveBeenCalled();
-      expect(page).toMatchObject({ source: 'final', status: 'FINALIZED', total: 2 });
+      expect(page).toMatchObject({ source: 'final', status: 'FINALIZED', total: 2, nextCursor: null });
       expect(page.items).toEqual([
         { placement: 1, playerId: 'bob', score: 700 },
         { placement: 2, playerId: 'alice', score: 300 },
       ]);
+    });
+
+    describe('cursors', () => {
+      it('hands out an offset cursor on a live page that has more rows', async () => {
+        prisma.tournament.findUnique.mockResolvedValue({ id: 't1', status: 'OPEN' });
+        leaderboard.getPage.mockResolvedValue({
+          total: 5,
+          items: [{ placement: 1, playerId: 'alice', score: 500 }],
+        });
+
+        const first = await service.getLeaderboard('t1', 1, 0);
+        expect(decodeCursor(first.nextCursor!)).toEqual({ offset: 1 });
+
+        await service.getLeaderboard('t1', 1, 0, first.nextCursor!);
+        expect(leaderboard.getPage).toHaveBeenLastCalledWith('t1', 1, 1);
+      });
+
+      it('continues a final page by keyset after the last row, not by OFFSET', async () => {
+        prisma.tournament.findUnique.mockResolvedValue({ id: 't1', status: 'FINALIZED' });
+        prisma.tournamentResult.count.mockResolvedValue(3);
+        prisma.$queryRaw.mockResolvedValue([{ placement: 2, player_id: 'carol', score: 300n }]);
+        const cursor = encodeCursor({ offset: 1, after: { placement: 1, playerId: 'bob' } });
+
+        const page = await service.getLeaderboard('t1', 1, 0, cursor);
+
+        expect(page.offset).toBe(1);
+        // Tagged template call: (strings, tournamentId, keyset fragment, limit, offset).
+        const [, , keyset, , offset] = prisma.$queryRaw.mock.calls[0] as [unknown, unknown, Prisma.Sql, unknown, unknown];
+        expect(keyset.values).toEqual([1, 1, 'bob']);
+        expect(offset).toBe(0);
+        expect(decodeCursor(page.nextCursor!)).toEqual({
+          offset: 2,
+          after: { placement: 2, playerId: 'carol' },
+        });
+      });
+
+      it('rejects a malformed cursor with 400', async () => {
+        await expect(service.getLeaderboard('t1', 10, 0, 'not-a-cursor')).rejects.toBeInstanceOf(
+          BadRequestException,
+        );
+        expect(prisma.tournament.findUnique).not.toHaveBeenCalled();
+      });
     });
   });
 });
