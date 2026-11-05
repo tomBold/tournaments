@@ -19,6 +19,7 @@ and uses a **BullMQ** delayed job to write **final placements to Postgres** afte
 - [Configuration](#configuration)
 - [Assumptions](#assumptions)
 - [Tradeoffs](#tradeoffs)
+- [Architecture and End-to-End Flow](#architecture-and-end-to-end-flow)
 
 ---
 
@@ -440,3 +441,398 @@ and tests replace the whole object with `{ provide: tournamentsConfig.KEY, useVa
 - **`@fastify/static` is pinned to 10.1.3.** Swagger UI needs it on Fastify. Later 10.1.x releases depend on an
   ESM-only `content-disposition`, which Jest can't load on Node below 24.9. 10.1.3 still satisfies the NestJS
   peer range.
+
+---
+
+## Architecture and End-to-End Flow
+
+This section walks through one tournament from creation to final results, based on the code on `main`. It is
+written for explaining the project in an interview. Everything up to [Later improvements](#later-improvements)
+describes the **original submission**. Line links point at the current `main` branch.
+
+### Glossary
+
+| Term | Meaning in this project |
+| --- | --- |
+| **API process** | [`src/main.ts`](src/main.ts): a NestJS app on Fastify that serves HTTP. |
+| **Worker process** | [`src/worker.ts`](src/worker.ts): the same codebase started without HTTP. It only runs background jobs. |
+| **Postgres** | The relational database and **source of truth** (the copy that wins if the stores disagree). Accessed through Prisma, a TypeScript ORM. |
+| **Transaction** | A group of SQL statements that commit together or not at all (`BEGIN` … `COMMIT`). |
+| **Row lock** | `FOR SHARE` lets many transactions read a row while preventing others from changing it. `FOR UPDATE` is exclusive: it waits until no one else holds a lock on the row. |
+| **Redis** | An in-memory key-value store. Here it holds the live leaderboards and the BullMQ queue. |
+| **Sorted set** | A Redis type that stores unique members, each with a numeric score, kept ordered by score. |
+| **BullMQ** | A Node.js job-queue library that stores its jobs **in Redis**. |
+| **Idempotent** | Doing it twice has the same effect as doing it once. |
+
+### End-to-end sequence
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant API as API process
+    participant PG as Postgres
+    participant R as Redis leaderboard keys
+    participant Q as BullMQ queue (in Redis)
+    participant W as Worker process
+
+    Note over C,W: 1. Create a tournament
+    C->>API: POST /tournaments {name, startsAt, endsAt, currency?}
+    API->>API: Validate body, endsAt after startsAt, endsAt in the future
+    API->>PG: INSERT tournaments (status OPEN)
+    API->>Q: add "finalize" job, jobId "finalize_" + id<br/>delay = endsAt - now + FINALIZE_GRACE_MS
+    Note right of Q: If add fails, the error is only logged.<br/>The sweep (step 5) covers it.
+    API-->>C: 201 tournament
+
+    Note over C,W: 2. Ingest a bet
+    C->>API: POST /bet {externalBetId, playerId, amount, currency, createdAt}
+    API->>API: ValidationPipe checks the body (400 if invalid)
+    API->>PG: BEGIN
+    API->>PG: INSERT bets ON CONFLICT (external_bet_id) DO NOTHING
+    alt externalBetId already stored
+        API->>PG: SELECT the existing bet
+        Note right of API: Different payload: 409 and ROLLBACK<br/>Same payload: continue
+    end
+    API->>PG: SELECT OPEN tournaments, same currency,<br/>startsAt ≤ createdAt ≤ endsAt, FOR SHARE
+    API->>PG: INSERT tournament_bets ON CONFLICT DO NOTHING<br/>RETURNING newly counted tournament ids
+    API->>PG: COMMIT
+    loop each matching tournament, after the commit
+        API->>R: Lua script: SADD bet id to seen set<br/>if new: ZINCRBY score, EXPIREAT both keys
+    end
+    API-->>C: 200 {betId, duplicate, countedTournamentIds}
+
+    Note over C,W: 3. Read the leaderboard
+    C->>API: GET /tournaments/{id}/leaderboard?limit&offset
+    API->>PG: SELECT tournament (404 if missing)
+    alt status OPEN
+        API->>R: MULTI ZCARD + ZREVRANGE WITHSCORES, then ZCOUNT
+        API-->>C: 200 source "live"
+    else status FINALIZED
+        API->>PG: COUNT and SELECT tournament_results ORDER BY placement
+        API-->>C: 200 source "final"
+    end
+
+    Note over C,W: 4. Finalize (delayed job becomes due at about endsAt + grace)
+    Q->>W: deliver "finalize" job
+    W->>PG: BEGIN, SELECT tournament FOR UPDATE<br/>(waits for in-flight bet transactions)
+    alt not found or already FINALIZED
+        W->>PG: COMMIT, nothing to do
+    else endsAt still in the future
+        W->>PG: COMMIT, nothing written
+        W-->>Q: throw, BullMQ retries with exponential backoff
+    else ended and still OPEN
+        W->>PG: INSERT tournament_results (SUM + RANK)
+        W->>PG: UPDATE tournaments SET status FINALIZED, finalized_at
+        W->>PG: COMMIT
+    end
+
+    Note over C,W: 5. Recovery sweep (repeats every FINALIZE_SWEEP_EVERY_MS, default 60 s)
+    Q->>W: deliver "sweep" job from the job scheduler
+    W->>PG: SELECT OPEN tournaments with endsAt before now - grace<br/>oldest first, up to FINALIZE_SWEEP_BATCH_SIZE
+    loop each overdue tournament
+        W->>PG: same finalize transaction as step 4<br/>(a failure is logged, the loop continues)
+    end
+```
+
+### Step by step
+
+#### 1. `POST /tournaments` — create and schedule
+
+[`TournamentsController.create`](src/tournaments/tournaments.controller.ts#L19-L39) passes the validated body
+to [`TournamentsService.create`](src/tournaments/tournaments.service.ts#L40-L76):
+
+1. **Validation.** The global `ValidationPipe` ([`configure-app.ts`](src/configure-app.ts#L5)) checks
+   [`CreateTournamentDto`](src/tournaments/dto/create-tournament.dto.ts). The service then rejects
+   `endsAt <= startsAt` and an `endsAt` that is already in the past
+   ([lines 44–50](src/tournaments/tournaments.service.ts#L44-L50)).
+2. **Persist.** One Prisma `create` inserts the row with status `OPEN` and currency `USD` by default
+   ([lines 52–54](src/tournaments/tournaments.service.ts#L52-L54)). This single insert is not wrapped in a
+   larger transaction.
+3. **Schedule.** `finalizationQueue.add('finalize', …)` creates a delayed BullMQ job
+   ([lines 56–68](src/tournaments/tournaments.service.ts#L56-L68)) with:
+   - `jobId: finalize_<tournamentId>`, a fixed id so the same tournament doesn't get two pending jobs;
+   - `delay: endsAt − now + FINALIZE_GRACE_MS` (5 s by default), so bets made in the last moments can still land;
+   - `attempts: 10` and exponential `backoff` starting at 5 s;
+   - `removeOnComplete: true` and `removeOnFail: false`, so failed jobs stay in Redis where they can be inspected.
+4. **If scheduling fails**, the error is logged and the tournament is still returned
+   ([lines 69–73](src/tournaments/tournaments.service.ts#L69-L73)). Returning an error would make the client
+   retry and create a duplicate tournament. The worker's sweep finalizes it later.
+
+#### 2. `POST /bet` — ingest a bet
+
+[`BetsController.ingest`](src/tournaments/bets.controller.ts#L17-L36) always answers `200` for a valid body,
+both new and duplicate, so clients can retry safely. The work happens in
+[`BetsService.ingest`](src/tournaments/bets.service.ts#L39-L99).
+
+**Inside the Postgres transaction** ([lines 42–83](src/tournaments/bets.service.ts#L42-L83)):
+
+1. **Store the bet once.** `INSERT … ON CONFLICT (external_bet_id) DO NOTHING RETURNING …`
+   ([lines 44–48](src/tournaments/bets.service.ts#L44-L48)). `external_bet_id` has a unique index
+   ([schema](prisma/schema.prisma#L35)), so a second insert with the same id returns no row instead of failing.
+2. **Duplicate check.** If nothing was inserted, the existing row is loaded and compared field by field
+   ([lines 50–56](src/tournaments/bets.service.ts#L50-L56),
+   [`assertSamePayload`](src/tournaments/bets.service.ts#L102-L113)). A different `playerId`, `amount`,
+   `currency` or `createdAt` throws `409 Conflict`, which rolls the transaction back. An identical payload continues,
+   because it might still need to be counted somewhere (for example in a tournament created since the first attempt).
+3. **Find matching tournaments.** `status = 'OPEN'`, same currency, and `starts_at <= createdAt <= ends_at`, read
+   `FOR SHARE` ([lines 60–67](src/tournaments/bets.service.ts#L60-L67)). The shared row lock means finalization,
+   which needs `FOR UPDATE`, has to wait until this bet commits. Bets don't block each other, because shared
+   locks are compatible.
+4. **Count it per tournament.** One `INSERT INTO tournament_bets … ON CONFLICT (tournament_id, bet_id) DO NOTHING
+   RETURNING tournament_id` ([lines 69–78](src/tournaments/bets.service.ts#L69-L78)). The composite primary key
+   ([schema](prisma/schema.prisma#L59)) is the real "once per tournament" guarantee. `RETURNING` only lists the
+   tournaments this request newly counted.
+5. **Timeout.** The transaction may wait behind a running finalization, so its timeout is `FINALIZE_TIMEOUT_MS + 5 s`
+   instead of Prisma's 5 s default ([line 82](src/tournaments/bets.service.ts#L82)).
+
+**After the commit, in Redis** ([lines 84–91](src/tournaments/bets.service.ts#L84-L91)): the service calls
+`LeaderboardService.addBet` for **every** matching tournament, not only the newly counted ones. That is what lets
+a retry repair a Redis write that failed the first time. The Lua script described below makes the extra calls
+harmless.
+
+**Response** ([lines 93–98](src/tournaments/bets.service.ts#L93-L98)): `duplicate` is `true` when the bet already
+existed and nothing new was counted in Postgres; `countedTournamentIds` lists the newly counted tournaments.
+
+#### 3. `GET /tournaments/:id/leaderboard` — read a page
+
+[`TournamentsController.leaderboard`](src/tournaments/tournaments.controller.ts#L41-L65) validates the id as a
+UUID and `limit` (1–100, default 50) and `offset` (≥ 0) through
+[`LeaderboardQueryDto`](src/tournaments/dto/leaderboard-query.dto.ts).
+[`TournamentsService.getLeaderboard`](src/tournaments/tournaments.service.ts#L78-L109) loads the tournament (404 if
+missing) and branches on its status:
+
+- **`OPEN`** — includes the period after `endsAt` but before the job has run. The page comes from Redis through
+  [`LeaderboardService.getPage`](src/tournaments/leaderboard.service.ts#L79-L119) and `source` is `live`.
+- **`FINALIZED`** — the page comes from `tournament_results` in Postgres, ordered by `placement` and then
+  `player_id COLLATE "C" DESC` so tied players keep the same order they had in Redis
+  ([lines 84–105](src/tournaments/tournaments.service.ts#L84-L105)). `source` is `final`.
+
+#### 4. Worker — finalize
+
+[`src/worker.ts`](src/worker.ts) starts a Nest application context (no HTTP server) from
+[`WorkerModule`](src/worker.module.ts), which adds
+[`FinalizationProcessor`](src/tournaments/finalization.processor.ts). For a `finalize` job it calls
+[`FinalizationService.finalize`](src/tournaments/finalization.service.ts#L24-L60).
+
+**Inside the Postgres transaction:**
+
+1. `SELECT status, ends_at FROM tournaments WHERE id = … FOR UPDATE`
+   ([lines 28–32](src/tournaments/finalization.service.ts#L28-L32)). This waits for every bet transaction holding
+   `FOR SHARE` on the row. While the worker holds the lock, new bets for this tournament wait at their own
+   `FOR SHARE`.
+2. Early exits ([lines 34–36](src/tournaments/finalization.service.ts#L34-L36)): `not-found`, `already-finalized`
+   (this is what makes a retried job safe), or `not-ended` (the job fired early, for example because of clock
+   differences between hosts).
+3. One `INSERT … SELECT` computes each player's `SUM(amount)` from `tournament_bets` and a placement with
+   `RANK() OVER (ORDER BY SUM(amount) DESC)` ([lines 38–47](src/tournaments/finalization.service.ts#L38-L47)).
+   `RANK()` gives tied players the same placement and skips the following numbers (1, 1, 3).
+4. The tournament is marked `FINALIZED` with `finalized_at`
+   ([lines 49–52](src/tournaments/finalization.service.ts#L49-L52)), and the transaction commits.
+
+**Afterwards**, nothing is written to Redis. The live keys stay until they expire, but they are no longer read,
+because the leaderboard endpoint now uses Postgres. Bets waiting on the lock then continue: their `SELECT … WHERE
+status = 'OPEN'` no longer matches this tournament, so they are stored but not counted towards it. The processor
+turns `not-ended` into a thrown error so BullMQ retries with backoff
+([lines 30–35](src/tournaments/finalization.processor.ts#L30-L35)).
+
+#### 5. Worker — recovery sweep
+
+On startup the processor registers a repeating `sweep` job with `upsertJobScheduler`
+([lines 20–26](src/tournaments/finalization.processor.ts#L20-L26)). "Upsert" means create or update, so restarts
+or several workers don't create duplicate schedules. Each run asks
+[`findOverdue`](src/tournaments/finalization.service.ts#L62-L72) for `OPEN` tournaments whose `endsAt` is more than
+the grace period in the past (oldest first, up to 100), and finalizes them one by one. A failing tournament is
+logged and skipped; it stays `OPEN` and is retried on the next run
+([lines 36–53](src/tournaments/finalization.processor.ts#L36-L53)).
+
+### Redis, explained from scratch
+
+Each tournament has two keys, built in
+[`LeaderboardService`](src/tournaments/leaderboard.service.ts#L48-L55):
+
+| Key | Redis type | Contents |
+| --- | --- | --- |
+| `tournament:{<id>}:leaderboard` | Sorted set | Member = `playerId`, score = total cents |
+| `tournament:{<id>}:bets` | Set | Internal bet ids (UUIDs) already added to the sorted set |
+
+The `{…}` part is a **hash tag**: in Redis Cluster only that part decides which node stores the key, so both keys
+of a tournament land together. A Lua script can only touch keys on the same node.
+
+**A sorted set** is like a dictionary from member to number that Redis keeps sorted by the number. Adding to a
+score or reading the top N is fast (logarithmic in the number of players), which is why live rankings use it
+instead of `ORDER BY` in SQL on every request.
+
+The commands the project uses:
+
+| Command | What it does | Where |
+| --- | --- | --- |
+| `SADD key member` | Adds a member to a plain set. Returns `1` if it was new, `0` if it was already there. | Lua script: "have we counted this bet?" |
+| `ZINCRBY key increment member` | Adds `increment` to the member's score, creating the member with that score if missing. | Lua script: add the bet amount to the player |
+| `EXPIREAT key unix-seconds` | Deletes the key automatically at that timestamp. | Lua script: `max(endsAt, now)` + 7 days ([lines 65–67](src/tournaments/leaderboard.service.ts#L65-L67)) |
+| `ZCARD key` | Number of members in the sorted set. | `getPage`: the `total` in the response |
+| `ZREVRANGE key start stop WITHSCORES` | Members by rank, highest score first, with their scores. Ranks are 0-based and `stop` is inclusive. | `getPage`: ranks `offset` to `offset + limit − 1` |
+| `ZCOUNT key min max` | Number of members with a score in `[min, max]`. A `(` prefix makes the bound exclusive. | `getPage`: `ZCOUNT key (score +inf` counts players **strictly** ahead of the page's first row |
+
+`ZCARD` and `ZREVRANGE` are sent together in a `MULTI`/`EXEC` block (Redis runs them back to back), followed by a
+separate `ZCOUNT` ([lines 88–105](src/tournaments/leaderboard.service.ts#L88-L105)). Placements are then computed
+in TypeScript ([lines 107–117](src/tournaments/leaderboard.service.ts#L107-L117)): the first row's placement is
+"players strictly ahead + 1", a row with the same score as the row before shares its placement, and any other row
+gets its absolute rank `offset + i + 1`. That way a tie that crosses a page boundary still shows the right number
+on page 2.
+
+**The Lua script** ([lines 13–22](src/tournaments/leaderboard.service.ts#L13-L22)) is registered once with ioredis
+`defineCommand` ([line 44](src/tournaments/leaderboard.service.ts#L44)) and runs inside Redis:
+
+```lua
+if redis.call('SADD', KEYS[1], ARGV[1]) == 1 then   -- KEYS[1] = seen set, ARGV[1] = bet id
+  redis.call('ZINCRBY', KEYS[2], ARGV[3], ARGV[2])  -- KEYS[2] = sorted set, ARGV[3] = amount, ARGV[2] = player
+  redis.call('EXPIREAT', KEYS[1], ARGV[4])          -- ARGV[4] = expiry timestamp
+  redis.call('EXPIREAT', KEYS[2], ARGV[4])
+  return 1
+end
+return 0
+```
+
+Redis runs a script **atomically**: no other command runs between its lines. Without that, two concurrent
+requests could both check "not seen yet" before either marked the bet as seen, and both would add the amount.
+
+**How a retried bet is prevented from scoring twice.** Two independent guards work together:
+
+1. **Postgres**: the `tournament_bets` primary key `(tournament_id, bet_id)` means the bet is recorded at most
+   once per tournament, even with ten identical concurrent requests.
+2. **Redis**: the `bets` set remembers which bet ids were already applied, and `ZINCRBY` only runs when `SADD`
+   returns `1`.
+
+The three retry cases:
+
+| What happened on the first attempt | What the retry does |
+| --- | --- |
+| Postgres and Redis both succeeded | Postgres inserts nothing (`duplicate: true`). The Lua script runs again, `SADD` returns `0`, the score is unchanged. |
+| Postgres committed, then the Redis call failed | The request fails, so the client retries. Postgres again inserts nothing, but this time `SADD` returns `1` and the score is added **once**. The response says `duplicate: true` because nothing new was counted in Postgres. |
+| Postgres rolled back | Nothing was stored. The retry behaves like a first attempt. |
+
+The Redis guard uses the internal `bets.id` (UUID), which is the same for every retry of one `externalBetId`.
+
+### BullMQ, delayed jobs and the worker
+
+**BullMQ is a job-queue library that keeps its jobs in Redis.** In this project it uses the **same Redis** as the
+leaderboards: [`CoreModule`](src/core.module.ts#L16-L21) builds the connection from `REDIS_URL` with
+[`bullConnectionFromUrl`](src/redis/redis-connection.ts). **It is not RabbitMQ**; there is no separate message
+broker to run.
+
+- **Producer:** the API adds jobs (`TournamentsService.create`).
+- **Queue:** `tournament-finalization` ([`finalization.queue.ts`](src/tournaments/finalization.queue.ts)), with two
+  job names: `finalize` (one delayed job per tournament) and `sweep` (repeating).
+- **Worker:** `FinalizationProcessor` extends `WorkerHost`, so `@nestjs/bullmq` creates a BullMQ worker that
+  pulls jobs from the queue and calls `process(job)`. It is only registered in the worker process, so the API
+  never runs jobs.
+
+**A delayed job** is saved in Redis immediately but only becomes available once its delay has elapsed. Because
+the job lives in Redis rather than in an in-process timer, it survives API and worker restarts.
+
+**A delayed job does not run at the exact scheduled instant.** The due time is the earliest it can run, not a
+promise. In practice it can start later because:
+
+- no worker is running or connected at that moment (it runs when a worker comes back);
+- the worker is busy with other jobs;
+- a previous attempt failed and the retry waits for its backoff;
+- the grace period (`FINALIZE_GRACE_MS`) deliberately pushes it past `endsAt`.
+
+It can also run before `endsAt` according to the worker's clock, for example when hosts' clocks differ. The
+`not-ended` check handles that by failing the attempt so BullMQ retries. Correctness never depends on exact
+timing: until finalization, the tournament is simply still `OPEN` and served live; the row lock ensures no bet is
+counted after results are written; and the sweep covers jobs that were never added at all.
+
+### Transactional outbox (concept)
+
+In the original flow, a bet is committed to Postgres and **then** written to Redis. Those are two separate
+systems, so there is a gap: if Redis is unavailable or the API process crashes between the two steps, Postgres has
+the bet but the live leaderboard doesn't. The original code closes that gap only if the client retries (see the
+table above). Final results are still correct either way, because they are computed from Postgres.
+
+A **transactional outbox** removes the dependency on the client. In the **same** Postgres transaction that
+records the bet, you also insert an "outbox" row meaning "this still needs to be applied to Redis". Because it
+commits atomically with the bet, the two can't disagree. A background **relay** reads outbox rows, applies them
+to Redis, and deletes them only after Redis has accepted them. If the relay crashes, it simply retries later; the
+idempotent Lua script makes re-applying harmless. The result is **at-least-once delivery** (each update is applied
+one or more times, never zero) with exactly-once *effect*.
+
+### Later improvements
+
+> **Not part of the original submission.** The items below come from a later pull request that was **closed
+> without being merged**. Its code exists only on the `harden-ingestion-and-leaderboard` branch, not on `main`,
+> so the file names below are not linked from this README.
+
+| Change | What it does |
+| --- | --- |
+| **`leaderboard_outbox` table + relay** | The bet transaction inserts an outbox row for every newly counted `(tournament_id, bet_id)`. A worker job (`LeaderboardOutboxService`, every `LEADERBOARD_OUTBOX_EVERY_MS`, default 5 s) reads rows with `FOR UPDATE SKIP LOCKED` (so several workers can share the work), applies them to Redis, and deletes them in the same transaction. The API now logs a failed Redis write instead of returning an error. |
+| **Leaderboard repair** | `LeaderboardRepairService` (every 5 min by default) compares the size of each tournament's Redis `bets` set with its count in `tournament_bets`. If Redis is behind, it rebuilds the board into temporary keys and swaps them in atomically with `RENAME`. The add-bets script refuses to write (returns `-1`) when only one of a tournament's two keys exists, since that means Redis lost data. |
+| **`CLOSING` status** | Finalization is split into two transactions: a short one that flips `OPEN` → `CLOSING` under an exclusive Postgres advisory lock, then the aggregate and `FINALIZED`, with no lock held. Bets take the advisory lock in shared mode instead of `FOR SHARE`, so they only wait for the short close step, and the bet transaction timeout drops to 10 s. The sweep also resumes tournaments left in `CLOSING`. |
+| **Smaller items** | A separate `leaderboard-maintenance` queue, so relay and repair can't delay finalization. Redis keys are deleted after finalization. The page read (`ZCARD`, `ZREVRANGE`, `ZCOUNT`) becomes one Lua script, so all three see the same data. A `/health` endpoint and Docker healthcheck. ioredis `maxRetriesPerRequest: 2` on the app's Redis client. A startup warning if Redis `maxmemory-policy` isn't `noeviction`. A per-player maximum score (`422`), cursor pagination, and a log warning for bets that arrive after their tournament closed. |
+
+### Design tradeoffs and production improvements
+
+**Required by the assignment** (and implemented in the original submission): the three endpoints, the inclusive
+`startsAt <= createdAt <= endsAt` rule, counting a bet in several tournaments, counting each `externalBetId` at
+most once per tournament with an idempotent success response, Redis for the live ranking, and a BullMQ job that
+writes final placements to Postgres after `endsAt`.
+
+**Already in the original as extra robustness:** the `409` for a reused `externalBetId` with a different payload,
+the row locks that stop late bets from changing final results, job retries with backoff, the recovery sweep, and
+computing final results from Postgres rather than copying them from Redis.
+
+**Main tradeoffs in the original design:**
+
+- **Two stores, no distributed transaction.** Postgres is authoritative and Redis is a fast, derived view. That
+  keeps the final results correct, but the live board can lag Postgres until a client retries.
+- **One Postgres row per bet per tournament.** This gives exact idempotency and an audit trail, at the cost of
+  write volume.
+- **Correctness through row locks.** Simple and verifiable, but the finalizer holds `FOR UPDATE` for the whole
+  aggregate. On a very large tournament, bets for *that* tournament wait for up to `FINALIZE_TIMEOUT_MS`.
+- **Live page reads aren't one snapshot.** The `ZCOUNT` runs after the `MULTI`, so a bet landing in between can
+  make one placement briefly off by one.
+
+**Optional hardening for production**, roughly in order of value:
+
+| Area | Original behavior | Realistic improvement |
+| --- | --- | --- |
+| Redis failure during a bet | Request fails after the Postgres commit; the client's retry repairs Redis. With ioredis defaults, a request can wait through many reconnect retries first. | Transactional outbox + relay. Fail fast on Redis commands. Run Redis with `noeviction` and persistence (AOF). |
+| Redis data loss mid-tournament | Live board stays short until finalization (which is still correct). | Rebuild a tournament's sorted set from `tournament_bets`. |
+| Finalization lock | `FOR UPDATE` held for the whole aggregate. | Close first (`CLOSING`), aggregate afterwards with no lock held. |
+| Missed or failed jobs | Sweep every 60 s; failed jobs kept in Redis (`removeOnFail: false`). | Alert when the sweep finds anything overdue. The BullMQ connection retries forever (`maxRetriesPerRequest: null`, required by workers), so `queue.add` in the API may wait during a Redis outage rather than fail; a fail-fast producer connection makes the "log and let the sweep handle it" path predictable. |
+| Worker and queue health | Logs only. | Metrics and alerts on: failed and delayed job counts, time from `ends_at` to `finalized_at`, worker liveness, outbox age (once added), Redis memory. Health endpoints for API and worker. |
+
+### 45–60 second interview explanation
+
+> It's a NestJS service with two processes from one codebase: an API and a BullMQ worker. Postgres is the source
+> of truth and Redis holds the live leaderboards. Creating a tournament inserts it in Postgres and schedules a
+> delayed BullMQ job for the end time plus a short grace period. When a bet arrives, one Postgres transaction
+> stores it by `externalBetId`, finds the open tournaments whose window contains `createdAt`, and records the bet
+> per tournament under a composite primary key, so it counts at most once. After the commit, a Lua script in Redis
+> adds the amount to a sorted set, but only if the bet id is new to that tournament, so retries never double
+> count. While a tournament is open the leaderboard comes from Redis; once the worker finalizes it, it locks the
+> tournament row, computes `SUM` and `RANK` from Postgres, writes the results, and marks it finalized, and from
+> then on the leaderboard comes from Postgres. A sweep every minute catches any tournament whose job was missed.
+
+### Likely follow-up questions
+
+**Why not compute final results from Redis?** Redis may be behind or lose data; Postgres is durable and locked
+against late bets. It costs one aggregate query per tournament.
+
+**What if Redis is down when a bet arrives?** The bet is committed in Postgres and the request fails. A retry
+counts it in Redis exactly once. Final results are unaffected. An outbox would remove the reliance on retries.
+
+**How do you stop a bet from being counted after finalization?** Bets hold `FOR SHARE` on the tournament row and
+the finalizer takes `FOR UPDATE`, so they can't overlap. Once finalized, the `status = 'OPEN'` filter excludes it.
+
+**What if the worker is down at `endsAt`?** The delayed job waits in Redis and runs when a worker is back. If the
+job was never created, the sweep finds the overdue tournament.
+
+**Is the finalize job safe to run twice?** Yes. A finalized tournament returns `already-finalized`, and result
+inserts use `ON CONFLICT DO NOTHING`.
+
+**Can you run several workers?** Yes. The row lock serializes finalization of one tournament, and the job
+scheduler is upserted, so there's one sweep schedule.
+
+**How are ties handled?** Competition ranking (1, 1, 3): `RANK()` in SQL, and "players strictly ahead + 1" via
+`ZCOUNT` in Redis.
