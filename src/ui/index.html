@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tournaments</title>
+<style>
+  :root { --bg: #f5f6f8; --card: #fff; --line: #e2e5ea; --text: #1d2330; --muted: #6b7380; --accent: #2f6fed; --ok: #1f9d55; --warn: #c27c0e; --err: #d64545; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); }
+  header { display: flex; align-items: baseline; gap: 16px; padding: 14px 24px; background: var(--card); border-bottom: 1px solid var(--line); }
+  header h1 { margin: 0; font-size: 18px; }
+  header a { color: var(--muted); font-size: 13px; }
+  main { display: grid; grid-template-columns: 380px 1fr; gap: 16px; padding: 16px 24px; max-width: 1200px; }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+  section + section { margin-top: 16px; }
+  h2 { margin: 0 0 10px; font-size: 14px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+  label { display: block; margin: 8px 0 3px; font-size: 12px; color: var(--muted); }
+  input, select { width: 100%; padding: 6px 8px; border: 1px solid var(--line); border-radius: 5px; font: inherit; }
+  .row { display: flex; gap: 8px; align-items: end; }
+  .row > * { flex: 1; }
+  button { margin-top: 10px; padding: 7px 12px; border: 1px solid var(--accent); border-radius: 5px; background: var(--accent); color: #fff; font: inherit; cursor: pointer; }
+  button.secondary { background: #fff; color: var(--accent); }
+  button.small { margin: 0; padding: 5px 8px; font-size: 12px; flex: none; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; font-weight: 600; background: var(--line); }
+  .OPEN, .live { background: #e3f6ea; color: var(--ok); }
+  .FINALIZED, .final { background: #e7eefe; color: var(--accent); }
+  table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+  th { font-size: 12px; color: var(--muted); font-weight: 600; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .meta { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; color: var(--muted); }
+  .empty { color: var(--muted); padding: 12px 0; }
+  #log { max-height: 420px; overflow: auto; }
+  .entry { border-top: 1px solid var(--line); padding: 8px 0; }
+  .entry:first-child { border-top: 0; }
+  .entry .head { display: flex; gap: 8px; font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+  .status { font-weight: 700; }
+  .s2 { color: var(--ok); } .s4 { color: var(--warn); } .s5, .s0 { color: var(--err); }
+  pre { margin: 4px 0 0; padding: 8px; background: #f8f9fb; border-radius: 5px; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
+  @media (max-width: 800px) { main { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Tournaments</h1>
+  <a href="/docs">API docs</a>
+</header>
+
+<main>
+  <div>
+    <section>
+      <h2>Create tournament</h2>
+      <form id="tournament-form">
+        <label for="t-name">Name</label>
+        <input id="t-name" required maxlength="200" value="Demo Cup">
+        <div class="row">
+          <div><label for="t-starts">Starts at (local time)</label><input id="t-starts" type="datetime-local" step="1" required></div>
+        </div>
+        <div class="row">
+          <div><label for="t-ends">Ends at (local time)</label><input id="t-ends" type="datetime-local" step="1" required></div>
+          <button type="button" class="small secondary" data-ends-in="60">+1 min</button>
+          <button type="button" class="small secondary" data-ends-in="600">+10 min</button>
+        </div>
+        <label for="t-currency">Currency</label>
+        <input id="t-currency" value="USD" pattern="[A-Z]{3}" maxlength="3">
+        <button type="submit">Create</button>
+      </form>
+    </section>
+
+    <section>
+      <h2>Send bet</h2>
+      <form id="bet-form">
+        <div class="row">
+          <div><label for="b-ext">externalBetId</label><input id="b-ext" required maxlength="255"></div>
+          <button type="button" class="small secondary" id="b-new-id">New id</button>
+        </div>
+        <label for="b-player">Player</label>
+        <input id="b-player" required maxlength="255" value="alice">
+        <div class="row">
+          <div><label for="b-amount">Amount (cents)</label><input id="b-amount" type="number" min="1" step="1" required value="250"></div>
+          <div><label for="b-currency">Currency</label><input id="b-currency" value="USD" pattern="[A-Z]{3}" maxlength="3"></div>
+        </div>
+        <div class="row">
+          <div><label for="b-created">Created at (local time)</label><input id="b-created" type="datetime-local" step="1" required></div>
+          <button type="button" class="small secondary" id="b-now">Now</button>
+        </div>
+        <button type="submit">Send</button>
+        <button type="button" class="secondary" id="b-resend" disabled>Resend last bet</button>
+      </form>
+    </section>
+  </div>
+
+  <div>
+    <section>
+      <h2>Leaderboard</h2>
+      <div class="row">
+        <div>
+          <label for="l-id">Tournament</label>
+          <select id="l-id"></select>
+        </div>
+        <div style="flex: 0 0 80px"><label for="l-limit">Limit</label><input id="l-limit" type="number" min="1" max="100" value="10"></div>
+        <div style="flex: 0 0 80px"><label for="l-offset">Offset</label><input id="l-offset" type="number" min="0" value="0"></div>
+        <button type="button" class="small" id="l-load">Load</button>
+      </div>
+      <label><input id="l-auto" type="checkbox" style="width: auto"> Refresh every 2 s</label>
+      <div id="board" class="empty">Create or pick a tournament.</div>
+    </section>
+
+    <section>
+      <div class="row" style="align-items: center">
+        <h2 style="margin: 0">Requests</h2>
+        <button type="button" class="small secondary" id="log-clear">Clear</button>
+      </div>
+      <div id="log"></div>
+    </section>
+  </div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const STORE = 'tournaments-ui';
+const saved = JSON.parse(localStorage.getItem(STORE) || '[]');
+let lastBet = null;
+let timer = null;
+
+// datetime-local has no timezone: read it as local time and send UTC ISO strings.
+const toLocalInput = (d) => new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 19);
+const fromLocalInput = (v) => new Date(v).toISOString();
+const escapeHtml = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+const cents = (n) => (n / 100).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+async function call(method, path, body, { log = true } = {}) {
+  let status = 0;
+  let data;
+  try {
+    const res = await fetch(path, {
+      method,
+      headers: body ? { 'content-type': 'application/json' } : {},
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    status = res.status;
+    data = await res.json().catch(() => null);
+  } catch (err) {
+    data = { error: err.message };
+  }
+  if (log) addLog(method, path, status, body, data);
+  return { ok: status >= 200 && status < 300, status, data };
+}
+
+function addLog(method, path, status, body, data) {
+  const el = document.createElement('div');
+  el.className = 'entry';
+  el.innerHTML =
+    `<div class="head"><span class="status s${String(status)[0]}">${status || 'ERR'}</span>` +
+    `<span>${method} ${escapeHtml(path)}</span><span style="margin-left:auto;color:var(--muted)">${new Date().toLocaleTimeString()}</span></div>` +
+    (body ? `<pre>→ ${escapeHtml(JSON.stringify(body, null, 2))}</pre>` : '') +
+    `<pre>← ${escapeHtml(JSON.stringify(data, null, 2))}</pre>`;
+  $('log').prepend(el);
+}
+
+function renderTournaments(selectId) {
+  $('l-id').innerHTML = saved.length
+    ? saved.map((t) => `<option value="${t.id}">${escapeHtml(t.name)} · ${t.id.slice(0, 8)}</option>`).join('')
+    : '<option value="">(none yet)</option>';
+  if (selectId) $('l-id').value = selectId;
+}
+
+async function loadBoard({ log = true } = {}) {
+  const id = $('l-id').value;
+  if (!id) return;
+  const qs = `limit=${$('l-limit').value}&offset=${$('l-offset').value}`;
+  const { ok, data } = await call('GET', `/tournaments/${id}/leaderboard?${qs}`, null, { log });
+  // A slower response for a previously selected tournament must not overwrite the current one.
+  if ($('l-id').value !== id) return;
+  if (!ok) {
+    $('board').className = 'empty';
+    $('board').textContent = data?.message ?? 'Could not load the leaderboard.';
+    return;
+  }
+  const t = saved.find((x) => x.id === id);
+  const span = t ? `${new Date(t.startsAt).toLocaleString()} → ${new Date(t.endsAt).toLocaleString()}` : '';
+  const rows = data.items
+    .map((r) => `<tr><td class="num">${r.placement}</td><td>${escapeHtml(r.playerId)}</td><td class="num">${r.score}</td><td class="num">${cents(r.score)}</td></tr>`)
+    .join('');
+  $('board').className = '';
+  $('board').innerHTML =
+    `<div class="meta"><span class="badge ${data.status}">${data.status}</span>` +
+    `<span class="badge ${data.source}">source: ${data.source} (${data.source === 'live' ? 'Redis' : 'Postgres'})</span>` +
+    `<span>${data.total} player(s)</span><span>${span}</span></div>` +
+    (rows
+      ? `<table><thead><tr><th class="num">#</th><th>Player</th><th class="num">Score (cents)</th><th class="num">Score</th></tr></thead><tbody>${rows}</tbody></table>`
+      : '<div class="empty">No bets counted yet.</div>');
+}
+
+$('tournament-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const body = {
+    name: $('t-name').value,
+    startsAt: fromLocalInput($('t-starts').value),
+    endsAt: fromLocalInput($('t-ends').value),
+    currency: $('t-currency').value || undefined,
+  };
+  const { ok, data } = await call('POST', '/tournaments', body);
+  if (!ok) return;
+  saved.unshift({ id: data.id, name: data.name, startsAt: data.startsAt, endsAt: data.endsAt });
+  localStorage.setItem(STORE, JSON.stringify(saved.slice(0, 20)));
+  renderTournaments(data.id);
+  loadBoard({ log: false });
+});
+
+document.querySelectorAll('[data-ends-in]').forEach((btn) =>
+  btn.addEventListener('click', () => {
+    $('t-ends').value = toLocalInput(new Date(Date.now() + Number(btn.dataset.endsIn) * 1000));
+  }),
+);
+
+async function sendBet(body) {
+  lastBet = body;
+  $('b-resend').disabled = false;
+  await call('POST', '/bet', body);
+  if ($('l-id').value) loadBoard({ log: false });
+}
+
+$('bet-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  await sendBet({
+    externalBetId: $('b-ext').value,
+    playerId: $('b-player').value,
+    amount: Number($('b-amount').value),
+    currency: $('b-currency').value,
+    createdAt: fromLocalInput($('b-created').value),
+  });
+  newBetId();
+});
+
+$('b-resend').addEventListener('click', () => lastBet && sendBet(lastBet));
+const newBetId = () => ($('b-ext').value = `bet_${Math.random().toString(36).slice(2, 10)}`);
+$('b-new-id').addEventListener('click', newBetId);
+$('b-now').addEventListener('click', () => ($('b-created').value = toLocalInput(new Date())));
+
+$('l-load').addEventListener('click', () => loadBoard());
+$('l-id').addEventListener('change', () => loadBoard({ log: false }));
+$('l-auto').addEventListener('change', (e) => {
+  clearInterval(timer);
+  if (e.target.checked) timer = setInterval(() => loadBoard({ log: false }), 2000);
+});
+$('log-clear').addEventListener('click', () => ($('log').innerHTML = ''));
+
+const now = new Date();
+$('t-starts').value = toLocalInput(new Date(now.getTime() - 60 * 60 * 1000));
+$('t-ends').value = toLocalInput(new Date(now.getTime() + 60 * 1000));
+$('b-created').value = toLocalInput(now);
+newBetId();
+renderTournaments(saved[0]?.id);
+if (saved.length) loadBoard({ log: false });
+</script>
+</body>
+</html>
